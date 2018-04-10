@@ -5,6 +5,8 @@ namespace InstagramAPI;
 use Evenement\EventEmitterInterface;
 use Evenement\EventEmitterTrait;
 use InstagramAPI\React\Connector;
+use InstagramAPI\Realtime\Command\Direct as DirectCommand;
+use InstagramAPI\Realtime\Command\IrisSubscribe;
 use InstagramAPI\Realtime\Mqtt\Auth;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -28,7 +30,9 @@ use React\EventLoop\LoopInterface;
  *  - thread-item-removed - An existing item has been removed from thread.
  *  - client-context-ack - Acknowledgment for client_context has been received.
  *  - unseen-count-update - Unseen count indicator has been updated.
- *  - error - An event of severity "error" occurred.
+ *  - region-hint - Preferred data center has been changed.
+ *  - warning - An exception of severity "warning" occurred.
+ *  - error - An exception of severity "error" occurred.
  */
 class Realtime implements EventEmitterInterface
 {
@@ -71,24 +75,35 @@ class Realtime implements EventEmitterInterface
             $this->_logger = new NullLogger();
         }
 
-        $this->_client = $this->_getClient();
+        $this->_client = $this->_buildMqttClient();
+        $this->on('region-hint', function ($region) {
+            $this->_instagram->settings->set('datacenter', $region);
+            $this->_client->setAdditionalOption('datacenter', $region);
+        });
     }
 
     /**
-     * Create a new MQTT client.
+     * Build a new MQTT client.
      *
      * @return Realtime\Mqtt
      */
-    protected function _getClient()
+    protected function _buildMqttClient()
     {
+        $additionalOptions = [
+            'datacenter'       => $this->_instagram->settings->get('datacenter'),
+            // TODO store presence in settings (?)
+            //'disable_presence' => $this->_instagram->account->getPresenceStatus()->getDisabled(),
+        ];
+
         return new Realtime\Mqtt(
             $this,
             new Connector($this->_instagram, $this->_loop),
             new Auth($this->_instagram),
             $this->_instagram->device,
-            $this->_instagram->experiments,
+            $this->_instagram,
             $this->_loop,
-            $this->_logger
+            $this->_logger,
+            $additionalOptions
         );
     }
 
@@ -109,19 +124,6 @@ class Realtime implements EventEmitterInterface
     }
 
     /**
-     * @param array $command
-     *
-     * @return bool
-     */
-    protected function _sendCommand(
-        array $command)
-    {
-        $command = static::jsonEncode($command);
-
-        return $this->_client->sendCommand($command);
-    }
-
-    /**
      * Marks thread item as seen.
      *
      * @param string $threadId
@@ -133,11 +135,15 @@ class Realtime implements EventEmitterInterface
         $threadId,
         $threadItemId)
     {
-        return $this->_sendCommand([
-            'thread_id' => $threadId,
-            'item_id'   => $threadItemId,
-            'action'    => 'mark_seen',
-        ]);
+        try {
+            $this->_client->sendCommand(new DirectCommand\MarkSeen($threadId, $threadItemId));
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage());
+
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -152,96 +158,16 @@ class Realtime implements EventEmitterInterface
         $threadId,
         $activityFlag)
     {
-        $context = Signatures::generateUUID(true);
-        $result = $this->_sendCommand([
-            'thread_id'       => $threadId,
-            'client_context'  => $context,
-            'activity_status' => $activityFlag ? '1' : '0',
-            'action'          => 'indicate_activity',
-        ]);
+        try {
+            $command = new DirectCommand\IndicateActivity($threadId, $activityFlag);
+            $this->_client->sendCommand($command);
 
-        return $result ? $context : false;
-    }
+            return $command->getClientContext();
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage());
 
-    /**
-     * Common method for all direct messages.
-     *
-     * @param array $options
-     *
-     * @return bool|string Client context or false if sending is unavailable.
-     */
-    protected function _sendItemToDirect(
-        array $options)
-    {
-        // Init command.
-        $command = [
-            'action' => 'send_item',
-        ];
-        // Handle client_context.
-        if (!isset($options['client_context'])) {
-            $command['client_context'] = Signatures::generateUUID(true);
-        } elseif (!Signatures::isValidUUID($options['client_context'])) {
-            return false;
-        } else {
-            $command['client_context'] = $options['client_context'];
-        }
-        // Handle thread_id.
-        if (!isset($options['thread_id'])) {
-            return false;
-        } elseif (!ctype_digit($options['thread_id']) && (!is_int($options['thread_id']) || $options['thread_id'] < 0)) {
-            return false;
-        } else {
-            $command['thread_id'] = $options['thread_id'];
-        }
-        // Handle item_type specifics.
-        if (!isset($options['item_type'])) {
             return false;
         }
-        switch ($options['item_type']) {
-            case 'text':
-                if (!isset($options['text'])) {
-                    return false;
-                }
-                $command['text'] = $options['text'];
-                break;
-            case 'like':
-                // Nothing here.
-                break;
-            case 'reaction':
-                // Handle item_id.
-                if (!isset($options['item_id'])) {
-                    return false;
-                } elseif (!ctype_digit($options['item_id']) && (!is_int($options['item_id']) || $options['item_id'] < 0)) {
-                    return false;
-                } else {
-                    $command['item_id'] = $options['item_id'];
-                    $command['node_type'] = 'item';
-                }
-                // Handle reaction_type.
-                if (!isset($options['reaction_type'])) {
-                    return false;
-                } elseif (!in_array($options['reaction_type'], ['like'], true)) {
-                    return false;
-                } else {
-                    $command['reaction_type'] = $options['reaction_type'];
-                }
-                // Handle reaction_status.
-                if (!isset($options['reaction_status'])) {
-                    return false;
-                } elseif (!in_array($options['reaction_status'], ['created', 'deleted'], true)) {
-                    return false;
-                } else {
-                    $command['reaction_status'] = $options['reaction_status'];
-                }
-                break;
-            default:
-                return false;
-        }
-        $command['item_type'] = $options['item_type'];
-        // Reorder command to simplify comparing against commands created by an application.
-        $command = $this->reorderFieldsByWeight($command, $this->getSendItemWeights());
-
-        return $this->_sendCommand($command) ? $command['client_context'] : false;
     }
 
     /**
@@ -259,11 +185,16 @@ class Realtime implements EventEmitterInterface
         $message,
         array $options = [])
     {
-        return $this->_sendItemToDirect(array_merge($options, [
-            'thread_id' => $threadId,
-            'item_type' => 'text',
-            'text'      => $message,
-        ]));
+        try {
+            $command = new DirectCommand\SendText($threadId, $message, $options);
+            $this->_client->sendCommand($command);
+
+            return $command->getClientContext();
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage());
+
+            return false;
+        }
     }
 
     /**
@@ -279,10 +210,16 @@ class Realtime implements EventEmitterInterface
         $threadId,
         array $options = [])
     {
-        return $this->_sendItemToDirect(array_merge($options, [
-            'thread_id' => $threadId,
-            'item_type' => 'like',
-        ]));
+        try {
+            $command = new DirectCommand\SendLike($threadId, $options);
+            $this->_client->sendCommand($command);
+
+            return $command->getClientContext();
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage());
+
+            return false;
+        }
     }
 
     /**
@@ -302,13 +239,22 @@ class Realtime implements EventEmitterInterface
         $reactionType,
         array $options = [])
     {
-        return $this->_sendItemToDirect(array_merge($options, [
-            'thread_id'       => $threadId,
-            'item_type'       => 'reaction',
-            'reaction_status' => 'created',
-            'reaction_type'   => $reactionType,
-            'item_id'         => $threadItemId,
-        ]));
+        try {
+            $command = new DirectCommand\SendReaction(
+                $threadId,
+                $threadItemId,
+                $reactionType,
+                DirectCommand\SendReaction::STATUS_CREATED,
+                $options
+            );
+            $this->_client->sendCommand($command);
+
+            return $command->getClientContext();
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage());
+
+            return false;
+        }
     }
 
     /**
@@ -328,88 +274,36 @@ class Realtime implements EventEmitterInterface
         $reactionType,
         array $options = [])
     {
-        return $this->_sendItemToDirect(array_merge($options, [
-            'thread_id'       => $threadId,
-            'item_type'       => 'reaction',
-            'reaction_status' => 'deleted',
-            'reaction_type'   => $reactionType,
-            'item_id'         => $threadItemId,
-        ]));
+        try {
+            $command = new DirectCommand\SendReaction(
+                $threadId,
+                $threadItemId,
+                $reactionType,
+                DirectCommand\SendReaction::STATUS_DELETED,
+                $options
+            );
+            $this->_client->sendCommand($command);
+
+            return $command->getClientContext();
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage());
+
+            return false;
+        }
     }
 
     /**
-     * Proxy for json_encode() with some necessary flags.
-     *
-     * @param mixed $data
-     *
-     * @return string
-     */
-    public static function jsonEncode(
-        $data)
-    {
-        return json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-    }
-
-    /**
-     * Reorders an array of fields by weights to simplify debugging.
-     *
-     * @param array $fields
-     * @param array $weights
-     *
-     * @return array
-     */
-    public function reorderFieldsByWeight(
-        array $fields,
-        array $weights)
-    {
-        uksort($fields, function ($a, $b) use ($weights) {
-            $a = isset($weights[$a]) ? $weights[$a] : PHP_INT_MAX;
-            $b = isset($weights[$b]) ? $weights[$b] : PHP_INT_MAX;
-            if ($a < $b) {
-                return -1;
-            } elseif ($a > $b) {
-                return 1;
-            } else {
-                return 0;
-            }
-        });
-
-        return $fields;
-    }
-
-    /**
-     * Returns an array of weights for ordering fields.
-     *
-     * @return array
-     */
-    public function getSendItemWeights()
-    {
-        return [
-            'thread_id'       => 10,
-            'item_type'       => 15,
-            'text'            => 20,
-            'client_context'  => 25,
-            'activity_status' => 30,
-            'reaction_type'   => 35,
-            'reaction_status' => 40,
-            'item_id'         => 45,
-            'node_type'       => 50,
-            'action'          => 55,
-            'profile_user_id' => 60,
-            'hashtag'         => 65,
-            'venue_id'        => 70,
-            'media_id'        => 75,
-        ];
-    }
-
-    /**
-     * Update Iris sequence ID.
+     * Receive offline messages starting from the sequence ID.
      *
      * @param int $sequenceId
      */
-    public function updateSequenceId(
+    public function receiveOfflineMessages(
         $sequenceId)
     {
-        $this->_client->updateSequenceId($sequenceId);
+        try {
+            $this->_client->sendCommand(new IrisSubscribe($sequenceId));
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage());
+        }
     }
 }

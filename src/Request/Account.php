@@ -31,6 +31,42 @@ class Account extends RequestCollection
     }
 
     /**
+     * Edit your biography.
+     *
+     * You are able to add `@mentions` and `#hashtags` to your biography, but
+     * be aware that Instagram disallows certain web URLs and shorteners.
+     *
+     * Also keep in mind that anyone can read your biography (even if your
+     * account is private).
+     *
+     * WARNING: Remember to also call `editProfile()` *after* using this
+     * function, so that you act like the real app!
+     *
+     * @param string $biography Biography text. Use "" for nothing.
+     *
+     * @throws \InvalidArgumentException
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\UserInfoResponse
+     *
+     * @see Account::editProfile() should be called after this function!
+     */
+    public function setBiography(
+        $biography)
+    {
+        if (!is_string($biography) || strlen($biography) > 150) {
+            throw new InvalidArgumentException('Please provide a 0 to 150 character string as biography.');
+        }
+
+        return $this->ig->request('accounts/set_biography/')
+            ->addPost('raw_text', $biography)
+            ->addPost('_uuid', $this->ig->uuid)
+            ->addPost('_uid', $this->ig->account_id)
+            ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->getResponse(new Response\UserInfoResponse());
+    }
+
+    /**
      * Edit your profile.
      *
      * Warning: You must provide ALL parameters to this function. The values
@@ -339,11 +375,11 @@ class Account extends RequestCollection
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
-     * @return \InstagramAPI\Response\RequestTwoFactorResponse
+     * @return \InstagramAPI\Response\SendTwoFactorEnableSMSResponse
      *
      * @see Account::enableTwoFactorSMS()
      */
-    public function requestTwoFactorSMS(
+    public function sendTwoFactorEnableSMS(
         $phoneNumber)
     {
         $cleanNumber = '+'.preg_replace('/[^0-9]/', '', $phoneNumber);
@@ -354,7 +390,7 @@ class Account extends RequestCollection
             ->addPost('_csrftoken', $this->ig->client->getToken())
             ->addPost('device_id', $this->ig->device_id)
             ->addPost('phone_number', $cleanNumber)
-            ->getResponse(new Response\RequestTwoFactorResponse());
+            ->getResponse(new Response\SendTwoFactorEnableSMSResponse());
     }
 
     /**
@@ -366,13 +402,13 @@ class Account extends RequestCollection
      *          PHONE NUMBER! WITHOUT THE CODES, YOU RISK LOSING YOUR ACCOUNT!
      *
      * @param string $phoneNumber      Phone number with country code. Format: +34123456789.
-     * @param string $verificationCode The code sent to your phone via Account::requestTwoFactorSMS().
+     * @param string $verificationCode The code sent to your phone via `Account::sendTwoFactorEnableSMS()`.
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\AccountSecurityInfoResponse
      *
-     * @see Account::requestTwoFactorSMS()
+     * @see Account::sendTwoFactorEnableSMS()
      * @see Account::getSecurityInfo()
      */
     public function enableTwoFactorSMS(
@@ -388,7 +424,7 @@ class Account extends RequestCollection
             ->addPost('device_id', $this->ig->device_id)
             ->addPost('phone_number', $cleanNumber)
             ->addPost('verification_code', $verificationCode)
-            ->getResponse(new Response\EnableTwoFactorResponse());
+            ->getResponse(new Response\EnableTwoFactorSMSResponse());
 
         return $this->getSecurityInfo();
     }
@@ -398,7 +434,7 @@ class Account extends RequestCollection
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
-     * @return \InstagramAPI\Response\DisableTwoFactorResponse
+     * @return \InstagramAPI\Response\DisableTwoFactorSMSResponse
      */
     public function disableTwoFactorSMS()
     {
@@ -406,7 +442,90 @@ class Account extends RequestCollection
             ->addPost('_uuid', $this->ig->uuid)
             ->addPost('_uid', $this->ig->account_id)
             ->addPost('_csrftoken', $this->ig->client->getToken())
-            ->getResponse(new Response\DisableTwoFactorResponse());
+            ->getResponse(new Response\DisableTwoFactorSMSResponse());
+    }
+
+    /**
+     * Request a new security code SMS for a Two Factor login account.
+     *
+     * NOTE: You should first attempt to `login()` which will automatically send
+     * you a two factor SMS. This function is just for asking for a new SMS if
+     * the old code has expired.
+     *
+     * NOTE: Instagram can only send you a new code every 60 seconds.
+     *
+     * @param string $username            Your Instagram username.
+     * @param string $twoFactorIdentifier Two factor identifier, obtained in
+     *                                    `login()` response.
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\TwoFactorLoginSMSResponse
+     */
+    public function sendTwoFactorLoginSMS(
+        $username,
+        $twoFactorIdentifier)
+    {
+        return $this->ig->request('accounts/send_two_factor_login_sms/')
+            ->addPost('two_factor_identifier', $twoFactorIdentifier)
+            ->addPost('username', $username)
+            ->addPost('device_id', $this->ig->device_id)
+            ->addPost('guid', $this->ig->uuid)
+            ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->getResponse(new Response\TwoFactorLoginSMSResponse());
+    }
+
+    /**
+     * Get presence status.
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\PresenceStatusResponse
+     */
+    public function getPresenceStatus()
+    {
+        return $this->ig->request('accounts/get_presence_disabled/')
+            ->setSignedGet(true)
+            ->getResponse(new Response\PresenceStatusResponse());
+    }
+
+    /**
+     * Enable presence.
+     *
+     * Allow accounts you follow and anyone you message to see when you were
+     * last active on Instagram apps.
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\GenericResponse
+     */
+    public function enablePresence()
+    {
+        return $this->ig->request('accounts/set_presence_disabled/')
+            ->addPost('_uuid', $this->ig->uuid)
+            ->addPost('_uid', $this->ig->account_id)
+            ->addPost('disabled', '0')
+            ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->getResponse(new Response\GenericResponse());
+    }
+
+    /**
+     * Disable presence.
+     *
+     * You won't be able to see the activity status of other accounts.
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\PresenceStatusResponse
+     */
+    public function disablePresence()
+    {
+        return $this->ig->request('accounts/set_presence_disabled/')
+            ->addPost('_uuid', $this->ig->uuid)
+            ->addPost('_uid', $this->ig->account_id)
+            ->addPost('disabled', '1')
+            ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->getResponse(new Response\GenericResponse());
     }
 
     /**
@@ -427,9 +546,76 @@ class Account extends RequestCollection
     }
 
     /**
-     * Get account badge notifications.
+     * Tell Instagram to send you an SMS code to verify your phone number.
      *
-     * TODO: We have no idea what this does. The response is always empty.
+     * @param string $phoneNumber Phone number with country code. Format: +34123456789.
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\SendSMSCodeResponse
+     */
+    public function sendSMSCode(
+        $phoneNumber)
+    {
+        $cleanNumber = '+'.preg_replace('/[^0-9]/', '', $phoneNumber);
+
+        return $this->ig->request('accounts/send_sms_code/')
+            ->addPost('_uuid', $this->ig->uuid)
+            ->addPost('_uid', $this->ig->account_id)
+            ->addPost('phone_number', $cleanNumber)
+            ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->getResponse(new Response\SendSMSCodeResponse());
+    }
+
+    /**
+     * Submit the SMS code you received to verify your phone number.
+     *
+     * @param string $phoneNumber      Phone number with country code. Format: +34123456789.
+     * @param string $verificationCode The code sent to your phone via `Account::sendSMSCode()`.
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\VerifySMSCodeResponse
+     *
+     * @see Account::sendSMSCode()
+     */
+    public function verifySMSCode(
+        $phoneNumber,
+        $verificationCode)
+    {
+        $cleanNumber = '+'.preg_replace('/[^0-9]/', '', $phoneNumber);
+
+        return $this->ig->request('accounts/verify_sms_code/')
+            ->addPost('_uuid', $this->ig->uuid)
+            ->addPost('_uid', $this->ig->account_id)
+            ->addPost('phone_number', $cleanNumber)
+            ->addPost('verification_code', $verificationCode)
+            ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->getResponse(new Response\VerifySMSCodeResponse());
+    }
+
+    /**
+     * Set contact point prefill.
+     *
+     * @param string $usage Either "prefill" or "auto_confirmation".
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\GenericResponse
+     */
+    public function setContactPointPrefill(
+        $usage)
+    {
+        return $this->ig->request('accounts/contact_point_prefill/')
+            ->setNeedsAuth(false)
+            ->addPost('phone_id', $this->ig->phone_id)
+            ->addPost('usage', $usage)
+            ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->getResponse(new Response\GenericResponse());
+    }
+
+    /**
+     * Get account badge notifications for the "Switch account" menu.
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *

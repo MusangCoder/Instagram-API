@@ -2,15 +2,9 @@
 
 namespace InstagramAPI;
 
-use Clue\React\HttpProxy\ProxyConnector as HttpConnectProxy;
-use Clue\React\Socks\Client as SocksProxy;
-use InstagramAPI\Media\Video\FFmpegWrapper;
+use InstagramAPI\Media\Video\FFmpeg;
 use InstagramAPI\Response\Model\Item;
 use InstagramAPI\Response\Model\Location;
-use React\EventLoop\LoopInterface;
-use React\Socket\Connector;
-use React\Socket\ConnectorInterface;
-use React\Socket\SecureConnector;
 
 class Utils
 {
@@ -42,18 +36,14 @@ class Utils
     const BOUNDARY_LENGTH = 30;
 
     /**
-     * Name of the detected ffmpeg executable, or FALSE if none found.
+     * Name of the detected ffmpeg executable.
      *
-     * @var string|bool|null
+     * @var string|null
+     *
+     * @deprecated
+     * @see FFmpeg::$defaultBinary
      */
     public static $ffmpegBin = null;
-
-    /**
-     * Wrapper for a ffmpeg binary.
-     *
-     * @var FFmpegWrapper
-     */
-    protected static $_ffmpegWrapper;
 
     /**
      * Name of the detected ffprobe executable, or FALSE if none found.
@@ -117,7 +107,7 @@ class Utils
         $string)
     {
         $result = 0;
-        for ($i = 0, $len = strlen($string); $i < $len; $i++) {
+        for ($i = 0, $len = strlen($string); $i < $len; ++$i) {
             $result = (-$result + ($result << 5) + ord($string[$i])) & 0xFFFFFFFF;
         }
         if (PHP_INT_SIZE > 4) {
@@ -206,6 +196,104 @@ class Utils
     }
 
     /**
+     * Converts a hours/minutes/seconds timestamp to seconds.
+     *
+     * @param string $timeStr Either `HH:MM:SS[.###]` (24h-clock) or
+     *                        `MM:SS[.###]` or `SS[.###]`. The `[.###]` is for
+     *                        optional millisecond precision if wanted, such as
+     *                        `00:01:01.149`.
+     *
+     * @throws \InvalidArgumentException If any part of the input is invalid.
+     *
+     * @return float The number of seconds, with decimals (milliseconds).
+     */
+    public static function hmsTimeToSeconds(
+        $timeStr)
+    {
+        if (!is_string($timeStr)) {
+            throw new \InvalidArgumentException('Invalid non-string timestamp.');
+        }
+
+        $sec = 0.0;
+        foreach (array_reverse(explode(':', $timeStr)) as $offsetKey => $v) {
+            if ($offsetKey > 2) {
+                throw new \InvalidArgumentException(sprintf(
+                    'Invalid input "%s" with too many components (max 3 is allowed "HH:MM:SS").',
+                    $timeStr
+                ));
+            }
+
+            // Parse component (supports "01" or "01.123" (milli-precision)).
+            if ($v === '' || !preg_match('/^\d+(?:\.\d+)?$/', $v)) {
+                throw new \InvalidArgumentException(sprintf(
+                    'Invalid non-digit or empty component "%s" in time string "%s".',
+                    $v, $timeStr
+                ));
+            }
+            if ($offsetKey !== 0 && strpos($v, '.') !== false) {
+                throw new \InvalidArgumentException(sprintf(
+                    'Unexpected period in time component "%s" in time string "%s". Only the seconds-component supports milliseconds.',
+                    $v, $timeStr
+                ));
+            }
+
+            // Convert the value to float and cap minutes/seconds to 60 (but
+            // allow any number of hours).
+            $v = (float) $v;
+            $maxValue = $offsetKey < 2 ? 60 : -1;
+            if ($maxValue >= 0 && $v > $maxValue) {
+                throw new \InvalidArgumentException(sprintf(
+                    'Invalid time component "%d" (its allowed range is 0-%d) in time string "%s".',
+                    $v, $maxValue, $timeStr
+                ));
+            }
+
+            // Multiply the current component of the "01:02:03" string with the
+            // power of its offset. Hour-offset will be 2, Minutes 1 and Secs 0;
+            // and "pow(60, 0)" will return 1 which is why seconds work too.
+            $sec += pow(60, $offsetKey) * $v;
+        }
+
+        return $sec;
+    }
+
+    /**
+     * Converts seconds to a hours/minutes/seconds timestamp.
+     *
+     * @param int|float $sec The number of seconds. Can have fractions (millis).
+     *
+     * @throws \InvalidArgumentException If any part of the input is invalid.
+     *
+     * @return string The time formatted as `HH:MM:SS.###` (`###` is millis).
+     */
+    public static function hmsTimeFromSeconds(
+        $sec)
+    {
+        if (!is_int($sec) && !is_float($sec)) {
+            throw new \InvalidArgumentException('Seconds must be a number.');
+        }
+
+        $wasNegative = false;
+        if ($sec < 0) {
+            $wasNegative = true;
+            $sec = abs($sec);
+        }
+
+        $result = sprintf(
+            '%02d:%02d:%06.3f', // "%06f" is because it counts the whole string.
+            floor($sec / 3600),
+            floor(fmod($sec / 60, 60)),
+            fmod($sec, 60)
+        );
+
+        if ($wasNegative) {
+            $result = '-'.$result;
+        }
+
+        return $result;
+    }
+
+    /**
      * Builds an Instagram media location JSON object in the correct format.
      *
      * This function is used whenever we need to send a location to Instagram's
@@ -251,48 +339,6 @@ class Utils
         $obj = self::reorderByHashCode($obj);
 
         return json_encode($obj);
-    }
-
-    /**
-     * Get a wrapper for ffmpeg/avconv binaries.
-     *
-     * TIP: If your binary isn't findable via the PATH environment locations,
-     * you can manually set the correct path to it. Before calling any functions
-     * that need FFmpeg, you must simply assign a manual value (ONCE) to tell us
-     * where to find your FFmpeg, like this:
-     *
-     * \InstagramAPI\Utils::$ffmpegBin = '/home/exampleuser/ffmpeg/bin/ffmpeg';
-     *
-     * @throws \RuntimeException
-     *
-     * @return FFmpegWrapper
-     */
-    public static function getFFmpegWrapper()
-    {
-        // We only resolve this once per session and then cache the result.
-        if (self::$ffmpegBin === null) {
-            @exec('ffmpeg -version 2>&1', $output, $statusCode);
-            if ($statusCode === 0) {
-                self::$ffmpegBin = 'ffmpeg';
-            } else {
-                @exec('avconv -version 2>&1', $output, $statusCode);
-                if ($statusCode === 0) {
-                    self::$ffmpegBin = 'avconv';
-                } else {
-                    self::$ffmpegBin = false; // Nothing found!
-                }
-            }
-        }
-
-        if (self::$ffmpegBin === false) {
-            throw new \RuntimeException('You must have FFmpeg to process videos.');
-        }
-
-        if (self::$_ffmpegWrapper === null || self::$_ffmpegWrapper->getFFmpegBinary() !== self::$ffmpegBin) {
-            self::$_ffmpegWrapper = new FFmpegWrapper(self::$ffmpegBin);
-        }
-
-        return self::$_ffmpegWrapper;
     }
 
     /**
@@ -414,6 +460,21 @@ class Utils
     }
 
     /**
+     * Verifies a rank token.
+     *
+     * @param string $rankToken
+     *
+     * @throws \InvalidArgumentException
+     */
+    public static function throwIfInvalidRankToken(
+        $rankToken
+    ) {
+        if (!Signatures::isValidUUID($rankToken)) {
+            throw new \InvalidArgumentException(sprintf('"%s" is not a valid rank token.', $rankToken));
+        }
+    }
+
+    /**
      * Verifies an array of story poll.
      *
      * @param array[] $storyPoll Array with story poll key-value pairs.
@@ -501,7 +562,7 @@ class Utils
                         }
                         break;
                     case 'font_size':
-                        if (!is_float($v) || $v !== 35.0) {
+                        if (!is_float($v) || ($v < 17.5 || $v > 35.0)) {
                             throw new \InvalidArgumentException(sprintf('Invalid value "%s" for tallies array-key "%s".', $v, $k));
                         }
                         break;
@@ -1021,128 +1082,5 @@ class Utils
         }
 
         return $urls;
-    }
-
-    /**
-     * Returns a proxy (if any) for a given host based on a given config.
-     *
-     * @param string $host        Host.
-     * @param mixed  $proxyConfig Proxy config.
-     *
-     * @return string|null
-     *
-     * @see http://docs.guzzlephp.org/en/stable/request-options.html#proxy
-     */
-    public static function getProxyForHost(
-        $host,
-        $proxyConfig = null)
-    {
-        // Empty config => no proxy.
-        if (empty($proxyConfig)) {
-            return;
-        }
-
-        // Plain string => return it.
-        if (!is_array($proxyConfig)) {
-            return $proxyConfig;
-        }
-
-        // HTTP proxies do not have CONNECT method.
-        if (!isset($proxyConfig['https'])) {
-            throw new \InvalidArgumentException('No proxy with CONNECT method found.');
-        }
-
-        // Check exceptions.
-        if (isset($proxyConfig['no']) && \GuzzleHttp\is_host_in_noproxy($host, $proxyConfig['no'])) {
-            return;
-        }
-
-        return $proxyConfig['https'];
-    }
-
-    /**
-     * Parse given SSL certificate verification and return a secure context.
-     *
-     * @param mixed $config
-     *
-     * @return array
-     *
-     * @see http://docs.guzzlephp.org/en/stable/request-options.html#verify
-     */
-    public static function getSecureContext(
-        $config)
-    {
-        $context = [];
-        if ($config === true) {
-            // PHP 5.6 or greater will find the system cert by default. When
-            // < 5.6, use the Guzzle bundled cacert.
-            if (PHP_VERSION_ID < 50600) {
-                $context['cafile'] = \GuzzleHttp\default_ca_bundle();
-            }
-        } elseif (is_string($config)) {
-            $context['cafile'] = $config;
-            if (!file_exists($config)) {
-                throw new \RuntimeException(sprintf('SSL CA bundle not found: "%s".', $config));
-            }
-        } elseif ($config === false) {
-            $context['verify_peer'] = false;
-            $context['verify_peer_name'] = false;
-
-            return $context;
-        } else {
-            throw new \InvalidArgumentException('Invalid verify request option.');
-        }
-        $context['verify_peer'] = true;
-        $context['verify_peer_name'] = true;
-        $context['allow_self_signed'] = false;
-
-        return $context;
-    }
-
-    /**
-     * Returns a secure connector for given configuration.
-     *
-     * @param LoopInterface $loop
-     * @param array         $secureContext
-     * @param string|null   $proxyAddress
-     *
-     * @return ConnectorInterface
-     */
-    public static function getSecureConnector(
-        LoopInterface $loop,
-        array $secureContext = [],
-        $proxyAddress = null)
-    {
-        if ($proxyAddress === null) {
-            $connector = new Connector($loop);
-
-            return new SecureConnector($connector, $loop, $secureContext);
-        }
-
-        if (strpos($proxyAddress, '://') === false) {
-            $scheme = 'http';
-        } else {
-            $scheme = parse_url($proxyAddress, PHP_URL_SCHEME);
-        }
-
-        $connector = new Connector($loop);
-        switch ($scheme) {
-            case 'socks':
-            case 'socks4':
-            case 'socks4a':
-            case 'socks5':
-                $connector = new SocksProxy($proxyAddress, $connector);
-                break;
-            case 'http':
-                $connector = new HttpConnectProxy($proxyAddress, $connector);
-                break;
-            case 'https':
-                $connector = new HttpConnectProxy($proxyAddress, new SecureConnector($connector, $loop, $secureContext));
-                break;
-            default:
-                throw new \InvalidArgumentException(sprintf('Unsupported proxy scheme: %s.', $scheme));
-        }
-
-        return new SecureConnector($connector, $loop, $secureContext);
     }
 }

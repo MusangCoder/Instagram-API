@@ -9,6 +9,7 @@ use InstagramAPI\AutoPropertyMapper;
  *
  * @method mixed getCanReply()
  * @method mixed getCanReshare()
+ * @method CoverMedia getCoverMedia()
  * @method DismissCard getDismissCard()
  * @method mixed getExpiringAt()
  * @method bool getHasBestiesMedia()
@@ -22,13 +23,17 @@ use InstagramAPI\AutoPropertyMapper;
  * @method Owner getOwner()
  * @method mixed getPrefetchCount()
  * @method mixed getRankedPosition()
+ * @method string getReelType()
  * @method string getSeen()
  * @method mixed getSeenRankedPosition()
  * @method mixed getShowNuxTooltip()
  * @method mixed getSourceToken()
+ * @method string getTitle()
+ * @method string getUniqueIntegerReelId()
  * @method User getUser()
  * @method bool isCanReply()
  * @method bool isCanReshare()
+ * @method bool isCoverMedia()
  * @method bool isDismissCard()
  * @method bool isExpiringAt()
  * @method bool isHasBestiesMedia()
@@ -42,13 +47,17 @@ use InstagramAPI\AutoPropertyMapper;
  * @method bool isOwner()
  * @method bool isPrefetchCount()
  * @method bool isRankedPosition()
+ * @method bool isReelType()
  * @method bool isSeen()
  * @method bool isSeenRankedPosition()
  * @method bool isShowNuxTooltip()
  * @method bool isSourceToken()
+ * @method bool isTitle()
+ * @method bool isUniqueIntegerReelId()
  * @method bool isUser()
  * @method $this setCanReply(mixed $value)
  * @method $this setCanReshare(mixed $value)
+ * @method $this setCoverMedia(CoverMedia $value)
  * @method $this setDismissCard(DismissCard $value)
  * @method $this setExpiringAt(mixed $value)
  * @method $this setHasBestiesMedia(bool $value)
@@ -62,13 +71,17 @@ use InstagramAPI\AutoPropertyMapper;
  * @method $this setOwner(Owner $value)
  * @method $this setPrefetchCount(mixed $value)
  * @method $this setRankedPosition(mixed $value)
+ * @method $this setReelType(string $value)
  * @method $this setSeen(string $value)
  * @method $this setSeenRankedPosition(mixed $value)
  * @method $this setShowNuxTooltip(mixed $value)
  * @method $this setSourceToken(mixed $value)
+ * @method $this setTitle(string $value)
+ * @method $this setUniqueIntegerReelId(string $value)
  * @method $this setUser(User $value)
  * @method $this unsetCanReply()
  * @method $this unsetCanReshare()
+ * @method $this unsetCoverMedia()
  * @method $this unsetDismissCard()
  * @method $this unsetExpiringAt()
  * @method $this unsetHasBestiesMedia()
@@ -82,10 +95,13 @@ use InstagramAPI\AutoPropertyMapper;
  * @method $this unsetOwner()
  * @method $this unsetPrefetchCount()
  * @method $this unsetRankedPosition()
+ * @method $this unsetReelType()
  * @method $this unsetSeen()
  * @method $this unsetSeenRankedPosition()
  * @method $this unsetShowNuxTooltip()
  * @method $this unsetSourceToken()
+ * @method $this unsetTitle()
+ * @method $this unsetUniqueIntegerReelId()
  * @method $this unsetUser()
  */
 class StoryTray extends AutoPropertyMapper
@@ -105,18 +121,22 @@ class StoryTray extends AutoPropertyMapper
         /*
          * Unix "taken_at" timestamp of the newest item in their story reel.
          */
-        'latest_reel_media'    => 'string',
-        'ranked_position'      => '',
-        'is_nux'               => '',
-        'show_nux_tooltip'     => '',
-        'muted'                => '',
-        'prefetch_count'       => '',
-        'location'             => 'Location',
-        'source_token'         => '',
-        'owner'                => 'Owner',
-        'nux_id'               => 'string',
-        'dismiss_card'         => 'DismissCard',
-        'can_reshare'          => '',
-        'has_besties_media'    => 'bool',
+        'latest_reel_media'      => 'string',
+        'ranked_position'        => '',
+        'is_nux'                 => '',
+        'show_nux_tooltip'       => '',
+        'muted'                  => '',
+        'prefetch_count'         => '',
+        'location'               => 'Location',
+        'source_token'           => '',
+        'owner'                  => 'Owner',
+        'nux_id'                 => 'string',
+        'dismiss_card'           => 'DismissCard',
+        'can_reshare'            => '',
+        'has_besties_media'      => 'bool',
+        'reel_type'              => 'string',
+        'unique_integer_reel_id' => 'string',
+        'cover_media'            => 'CoverMedia',
+        'title'                  => 'string',
     ];
 }

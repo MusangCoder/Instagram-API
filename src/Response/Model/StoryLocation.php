@@ -3,18 +3,20 @@
 namespace InstagramAPI\Response\Model;
 
 use InstagramAPI\AutoPropertyMapper;
+use InstagramAPI\Response\PropertyCollection;
 
 /**
  * StoryLocation.
  *
  * @method string getAttribution()
  * @method float getHeight()
- * @method mixed getIsPinned()
+ * @method int getIsPinned()
  * @method Location getLocation()
  * @method float getRotation()
  * @method float getWidth()
  * @method float getX()
  * @method float getY()
+ * @method float getZ()
  * @method bool isAttribution()
  * @method bool isHeight()
  * @method bool isIsPinned()
@@ -23,14 +25,16 @@ use InstagramAPI\AutoPropertyMapper;
  * @method bool isWidth()
  * @method bool isX()
  * @method bool isY()
+ * @method bool isZ()
  * @method $this setAttribution(string $value)
  * @method $this setHeight(float $value)
- * @method $this setIsPinned(mixed $value)
+ * @method $this setIsPinned(int $value)
  * @method $this setLocation(Location $value)
  * @method $this setRotation(float $value)
  * @method $this setWidth(float $value)
  * @method $this setX(float $value)
  * @method $this setY(float $value)
+ * @method $this setZ(float $value)
  * @method $this unsetAttribution()
  * @method $this unsetHeight()
  * @method $this unsetIsPinned()
@@ -39,17 +43,13 @@ use InstagramAPI\AutoPropertyMapper;
  * @method $this unsetWidth()
  * @method $this unsetX()
  * @method $this unsetY()
+ * @method $this unsetZ()
  */
 class StoryLocation extends AutoPropertyMapper
 {
     const JSON_PROPERTY_MAP = [
-        'rotation'    => 'float',
-        'x'           => 'float',
-        'y'           => 'float',
-        'height'      => 'float',
-        'width'       => 'float',
+        PropertyCollection\Sticker::class,
         'location'    => 'Location',
         'attribution' => 'string',
-        'is_pinned'   => '',
     ];
 }

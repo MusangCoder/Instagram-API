@@ -411,8 +411,10 @@ class Media extends RequestCollection
      * @param string $mediaId   The media ID in Instagram's internal format (ie "3482384834_43294").
      * @param string $commentId The parent comment's ID.
      * @param array  $options   An associative array of optional parameters, including:
-     *                          "max_id" - next "maximum ID" (get older comments, before this ID), used for backwards pagination.
+     *                          "max_id" - next "maximum ID" (get older comments, before this ID), used for backwards pagination;
+     *                          "min_id" - next "minimum ID" (get newer comments, after this ID), used for forwards pagination.
      *
+     * @throws \InvalidArgumentException
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\MediaCommentRepliesResponse
@@ -422,10 +424,16 @@ class Media extends RequestCollection
         $commentId,
         array $options = [])
     {
-        $request = $this->ig->request("media/{$mediaId}/comments/{$commentId}/child_comments/");
+        $request = $this->ig->request("media/{$mediaId}/comments/{$commentId}/inline_child_comments/");
+
+        if (isset($options['min_id'], $options['max_id'])) {
+            throw new \InvalidArgumentException('You can use either "min_id" or "max_id", but not both at the same time.');
+        }
 
         if (isset($options['max_id'])) {
             $request->addParam('max_id', $options['max_id']);
+        } elseif (isset($options['min_id'])) {
+            $request->addParam('min_id', $options['min_id']);
         }
 
         return $request->getResponse(new Response\MediaCommentRepliesResponse());
@@ -626,11 +634,7 @@ class Media extends RequestCollection
     public function getSavedFeed(
         $maxId = null)
     {
-        $request = $this->ig->request('feed/saved/')
-            ->addPost('_uuid', $this->ig->uuid)
-            ->addPost('_uid', $this->ig->account_id)
-            ->addPost('_csrftoken', $this->ig->client->getToken());
-
+        $request = $this->ig->request('feed/saved/');
         if ($maxId !== null) {
             $request->addParam('max_id', $maxId);
         }
@@ -648,9 +652,6 @@ class Media extends RequestCollection
     public function getBlockedMedia()
     {
         return $this->ig->request('media/blocked/')
-            ->addPost('_uuid', $this->ig->uuid)
-            ->addPost('_uid', $this->ig->account_id)
-            ->addPost('_csrftoken', $this->ig->client->getToken())
             ->getResponse(new Response\BlockedMediaResponse());
     }
 

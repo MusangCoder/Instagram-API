@@ -8,12 +8,17 @@ use BinSoul\Net\Mqtt\DefaultMessage;
 use BinSoul\Net\Mqtt\Message;
 use Evenement\EventEmitterInterface;
 use Fbns\Client\AuthInterface;
-use InstagramAPI\Client as HttpClient;
 use InstagramAPI\Constants;
 use InstagramAPI\Devices\DeviceInterface;
+use InstagramAPI\ExperimentsInterface;
 use InstagramAPI\React\PersistentInterface;
 use InstagramAPI\React\PersistentTrait;
-use InstagramAPI\Realtime;
+use InstagramAPI\Realtime\Command\UpdateSubscriptions;
+use InstagramAPI\Realtime\Subscription\GraphQl\AppPresenceSubscription;
+use InstagramAPI\Realtime\Subscription\GraphQl\DirectTypingSubscription;
+use InstagramAPI\Realtime\Subscription\Skywalker\DirectSubscription;
+use InstagramAPI\Realtime\Subscription\Skywalker\LiveSubscription;
+use InstagramAPI\Signatures;
 use Psr\Log\LoggerInterface;
 use React\EventLoop\LoopInterface;
 use React\EventLoop\Timer\TimerInterface;
@@ -23,74 +28,7 @@ class Mqtt implements PersistentInterface
 {
     use PersistentTrait;
 
-    const CONNECTION_TIMEOUT = 5;
-
     const REALTIME_CLIENT_TYPE = 'mqtt';
-
-    /* PubSub topics */
-    const DIRECT_TOPIC_TEMPLATE = 'ig/u/v1/%s';
-    const LIVE_TOPIC_TEMPLATE = 'ig/live_notification_subscribe/%s';
-
-    /* GraphQL subscription topics */
-    const TYPING_TOPIC_TEMPLATE = '1/graphqlsubscriptions/17867973967082385/{"input_data": {"user_id":%s}}';
-
-    /* MQTT server options */
-    const DEFAULT_HOST = 'edge-mqtt.facebook.com';
-    const DEFAULT_PORT = 443;
-
-    /** MQTT protocol options */
-    const MQTT_KEEPALIVE = 900;
-    const MQTT_VERSION = 3;
-
-    /** MQTT QoS */
-    const FIRE_AND_FORGET = 0;
-    const ACKNOWLEDGED_DELIVERY = 1;
-
-    /** Topic+ID pairs */
-    const PUBSUB_TOPIC = '/pubsub';
-    const PUBSUB_TOPIC_ID = '88';
-
-    const SEND_MESSAGE_TOPIC = '/ig_send_message';
-    const SEND_MESSAGE_TOPIC_ID = '132';
-
-    const SEND_MESSAGE_RESPONSE_TOPIC = '/ig_send_message_response';
-    const SEND_MESSAGE_RESPONSE_TOPIC_ID = '133';
-
-    const IRIS_SUB_TOPIC = '/ig_sub_iris';
-    const IRIS_SUB_TOPIC_ID = '134';
-
-    const IRIS_SUB_RESPONSE_TOPIC = '/ig_sub_iris_response';
-    const IRIS_SUB_RESPONSE_TOPIC_ID = '135';
-
-    const MESSAGE_SYNC_TOPIC = '/ig_message_sync';
-    const MESSAGE_SYNC_TOPIC_ID = '146';
-
-    const REALTIME_SUB_TOPIC = '/ig_realtime_sub';
-    const REALTIME_SUB_TOPIC_ID = '149';
-
-    const GRAPHQL_TOPIC = '/graphql';
-    const GRAPHQL_TOPIC_ID = '9';
-
-    /** MQTT client options */
-    const NETWORK_TYPE_WIFI = 1;
-    const CLIENT_TYPE = 'cookie_auth';
-    const PUBLISH_FORMAT = 'jz';
-
-    /** MQTT client capabilities */
-    const CP_ACKNOWLEDGED_DELIVERY = 0;
-    const CP_PROCESSING_LASTACTIVE_PRESENCEINFO = 1;
-    const CP_EXACT_KEEPALIVE = 2;
-    const CP_REQUIRES_JSON_UNICODE_ESCAPES = 3;
-    const CP_DELTA_SENT_MESSAGE_ENABLED = 4;
-    const CP_USE_ENUM_TOPIC = 5;
-    const CP_SUPPRESS_GETDIFF_IN_CONNECT = 6;
-    const CP_USE_THRIFT_FOR_INBOX = 7;
-    const CP_USE_SEND_PINGRESP = 8;
-    const CP_REQUIRE_REPLAY_PROTECTION = 9;
-    const CP_DATA_SAVING_MODE = 10;
-    const CP_TYPING_OFF_WHEN_SENDING_MESSAGE = 11;
-
-    const INVALID_SEQUENCE_ID = -1;
 
     /** @var EventEmitterInterface */
     protected $_target;
@@ -104,8 +42,14 @@ class Mqtt implements PersistentInterface
     /** @var DeviceInterface */
     protected $_device;
 
+    /** @var ExperimentsInterface */
+    protected $_experiments;
+
     /** @var LoopInterface */
     protected $_loop;
+
+    /** @var array */
+    protected $_additionalOptions;
 
     /** @var TimerInterface */
     protected $_keepaliveTimer;
@@ -116,13 +60,8 @@ class Mqtt implements PersistentInterface
     /** @var LoggerInterface */
     protected $_logger;
 
-    /** @var int */
-    protected $_capabilities;
-
-    /** @var string[] */
-    protected $_pubsubTopics;
-    /** @var string[] */
-    protected $_graphqlTopics;
+    /** @var SubscriptionInterface[][] */
+    protected $_subscriptions;
 
     /** @var ReactMqttClient */
     protected $_client;
@@ -134,9 +73,18 @@ class Mqtt implements PersistentInterface
     /** @var string|null */
     protected $_msgTypeBlacklist;
     /** @var bool */
-    protected $_graphQlEnabled;
-    /** @var int */
-    protected $_sequenceId;
+    protected $_graphQlTypingEnabled;
+    /** @var bool */
+    protected $_inboxPresenceEnabled;
+    /** @var bool */
+    protected $_threadPresenceEnabled;
+    /** @var bool */
+    protected $_regionHintEnabled;
+
+    /** @var ParserInterface[] */
+    protected $_parsers;
+    /** @var HandlerInterface[] */
+    protected $_handlers;
 
     /**
      * Constructor.
@@ -145,18 +93,22 @@ class Mqtt implements PersistentInterface
      * @param ConnectorInterface    $connector
      * @param AuthInterface         $auth
      * @param DeviceInterface       $device
-     * @param array                 $experiments
+     * @param ExperimentsInterface  $experiments
      * @param LoopInterface         $loop
      * @param LoggerInterface       $logger
+     * @param array                 $additionalOptions Supported options:
+     *                                                 - disable_presence
+     *                                                 - datacenter
      */
     public function __construct(
         EventEmitterInterface $target,
         ConnectorInterface $connector,
         AuthInterface $auth,
         DeviceInterface $device,
-        array $experiments,
+        ExperimentsInterface $experiments,
         LoopInterface $loop,
-        LoggerInterface $logger)
+        LoggerInterface $logger,
+        array $additionalOptions = [])
     {
         $this->_target = $target;
         $this->_connector = $connector;
@@ -164,13 +116,32 @@ class Mqtt implements PersistentInterface
         $this->_device = $device;
         $this->_loop = $loop;
         $this->_logger = $logger;
+        $this->_additionalOptions = $additionalOptions;
+
+        $this->_subscriptions = [];
 
         $this->_loadExperiments($experiments);
+        $this->_initSubscriptions();
 
         $this->_shutdown = false;
         $this->_client = $this->_getClient();
 
-        $this->_sequenceId = self::INVALID_SEQUENCE_ID;
+        $this->_parsers = [
+            Mqtt\Topics::PUBSUB                => new Parser\SkywalkerParser(),
+            Mqtt\Topics::SEND_MESSAGE_RESPONSE => new Parser\JsonParser(Handler\DirectHandler::MODULE),
+            Mqtt\Topics::IRIS_SUB_RESPONSE     => new Parser\JsonParser(Handler\IrisHandler::MODULE),
+            Mqtt\Topics::MESSAGE_SYNC          => new Parser\IrisParser(),
+            Mqtt\Topics::REALTIME_SUB          => new Parser\GraphQlParser(),
+            Mqtt\Topics::GRAPHQL               => new Parser\GraphQlParser(),
+            Mqtt\Topics::REGION_HINT           => new Parser\RegionHintParser(),
+        ];
+        $this->_handlers = [
+            Handler\DirectHandler::MODULE     => new Handler\DirectHandler($this->_target),
+            Handler\LiveHandler::MODULE       => new Handler\LiveHandler($this->_target),
+            Handler\IrisHandler::MODULE       => new Handler\IrisHandler($this->_target),
+            Handler\PresenceHandler::MODULE   => new Handler\PresenceHandler($this->_target),
+            Handler\RegionHintHandler::MODULE => new Handler\RegionHintHandler($this->_target),
+        ];
     }
 
     /** {@inheritdoc} */
@@ -186,13 +157,112 @@ class Mqtt implements PersistentInterface
     }
 
     /**
+     * Add a subscription to the list.
+     *
+     * @param SubscriptionInterface $subscription
+     */
+    public function addSubscription(
+        SubscriptionInterface $subscription)
+    {
+        $this->_doAddSubscription($subscription, true);
+    }
+
+    /**
+     * Remove a subscription from the list.
+     *
+     * @param SubscriptionInterface $subscription
+     */
+    public function removeSubscription(
+        SubscriptionInterface $subscription)
+    {
+        $this->_doRemoveSubscription($subscription, true);
+    }
+
+    /**
+     * Set an additional option.
+     *
+     * @param string $option
+     * @param mixed  $value
+     */
+    public function setAdditionalOption(
+        $option,
+        $value)
+    {
+        $this->_additionalOptions[$option] = $value;
+    }
+
+    /**
+     * Add a subscription to the list and send a command (optional).
+     *
+     * @param SubscriptionInterface $subscription
+     * @param bool                  $sendCommand
+     */
+    protected function _doAddSubscription(
+        SubscriptionInterface $subscription,
+        $sendCommand)
+    {
+        $topic = $subscription->getTopic();
+        $id = $subscription->getId();
+
+        // Check whether we already subscribed to it.
+        if (isset($this->_subscriptions[$topic][$id])) {
+            return;
+        }
+
+        // Add the subscription to the list.
+        if (!isset($this->_subscriptions[$topic])) {
+            $this->_subscriptions[$topic] = [];
+        }
+        $this->_subscriptions[$topic][$id] = $subscription;
+
+        // Send a command when needed.
+        if (!$sendCommand || $this->_isConnected()) {
+            return;
+        }
+
+        $this->_updateSubscriptions($topic, [$subscription], []);
+    }
+
+    /**
+     * Remove a subscription from the list and send a command (optional).
+     *
+     * @param SubscriptionInterface $subscription
+     * @param bool                  $sendCommand
+     */
+    protected function _doRemoveSubscription(
+        SubscriptionInterface $subscription,
+        $sendCommand)
+    {
+        $topic = $subscription->getTopic();
+        $id = $subscription->getId();
+
+        // Check whether we are subscribed to it.
+        if (!isset($this->_subscriptions[$topic][$id])) {
+            return;
+        }
+
+        // Remove the subscription from the list.
+        unset($this->_subscriptions[$topic][$id]);
+        if (!count($this->_subscriptions[$topic])) {
+            unset($this->_subscriptions[$topic]);
+        }
+
+        // Send a command when needed.
+        if (!$sendCommand || $this->_isConnected()) {
+            return;
+        }
+
+        $this->_updateSubscriptions($topic, [], [$subscription]);
+    }
+
+    /**
      * Cancel a keepalive timer (if any).
      */
     protected function _cancelKeepaliveTimer()
     {
         if ($this->_keepaliveTimer !== null) {
             if ($this->_keepaliveTimer->isActive()) {
-                $this->_logger->info('Existing keepalive timer has been canceled.');
+                $this->_logger->debug('Existing keepalive timer has been canceled.');
                 $this->_keepaliveTimer->cancel();
             }
             $this->_keepaliveTimer = null;
@@ -205,8 +275,8 @@ class Mqtt implements PersistentInterface
     protected function _setKeepaliveTimer()
     {
         $this->_cancelKeepaliveTimer();
-        $keepaliveInterval = self::MQTT_KEEPALIVE;
-        $this->_logger->info(sprintf('Setting up keepalive timer to %d seconds', $keepaliveInterval));
+        $keepaliveInterval = Mqtt\Config::MQTT_KEEPALIVE;
+        $this->_logger->debug(sprintf('Setting up keepalive timer to %d seconds', $keepaliveInterval));
         $this->_keepaliveTimer = $this->_loop->addTimer($keepaliveInterval, function () {
             $this->_logger->info('Keepalive timer has been fired.');
             $this->_disconnect();
@@ -219,19 +289,19 @@ class Mqtt implements PersistentInterface
     protected function _connect()
     {
         $this->_setReconnectTimer(function () {
-            $this->_logger->info(sprintf('Connecting to %s:%d...', self::DEFAULT_HOST, self::DEFAULT_PORT));
+            $this->_logger->info(sprintf('Connecting to %s:%d...', Mqtt\Config::DEFAULT_HOST, Mqtt\Config::DEFAULT_PORT));
 
             $connection = new DefaultConnection(
                 $this->_getMqttUsername(),
                 $this->_auth->getPassword(),
                 null,
                 $this->_auth->getClientId(),
-                self::MQTT_KEEPALIVE,
-                self::MQTT_VERSION,
+                Mqtt\Config::MQTT_KEEPALIVE,
+                Mqtt\Config::MQTT_VERSION,
                 true
             );
 
-            return $this->_client->connect(self::DEFAULT_HOST, self::DEFAULT_PORT, $connection, self::CONNECTION_TIMEOUT);
+            return $this->_client->connect(Mqtt\Config::DEFAULT_HOST, Mqtt\Config::DEFAULT_PORT, $connection, Mqtt\Config::CONNECTION_TIMEOUT);
         });
     }
 
@@ -276,209 +346,102 @@ class Mqtt implements PersistentInterface
     }
 
     /**
-     * Check if feature is enabled.
+     * Send the command.
      *
-     * @param array  $params
-     * @param string $feature
+     * @param CommandInterface $command
      *
-     * @return bool
-     */
-    protected function _isFeatureEnabled(
-        array $params,
-        $feature)
-    {
-        if (!isset($params[$feature])) {
-            return false;
-        }
-
-        return in_array($params[$feature], ['enabled', 'true', '1']);
-    }
-
-    /**
-     * Send command.
-     *
-     * @param string $command
-     *
-     * @return bool
-     */
-    protected function _sendCommand(
-        $command)
-    {
-        $this->_publish(self::SEND_MESSAGE_TOPIC, $command, self::FIRE_AND_FORGET);
-
-        return true;
-    }
-
-    /**
-     * Proxy for _sendCommand().
-     *
-     * @param string $command
-     *
-     * @return bool
+     * @throws \LogicException
      */
     public function sendCommand(
-        $command)
+        CommandInterface $command)
     {
         if (!$this->_isConnected()) {
-            return false;
+            throw new \LogicException('Tried to send the command while offline.');
         }
 
-        try {
-            return $this->_sendCommand($command);
-        } catch (\Exception $e) {
-            $this->_logger->error($e->getMessage());
-
-            return false;
-        }
+        $this->_publish(
+            $command->getTopic(),
+            json_encode($command, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            $command->getQosLevel()
+        );
     }
 
     /**
-     * Process incoming action.
+     * Load the experiments.
      *
-     * @param array $message
-     */
-    protected function _processAction(
-        array $message)
-    {
-        $this->_logger->info(sprintf('Received action "%s"', $message['action']));
-        switch ($message['action']) {
-            case Action::ACK:
-                /** @var Action\Ack $action */
-                $action = new Action\Ack($message);
-                break;
-            default:
-                $this->_logger->warning(sprintf('Action "%s" is ignored (unknown type)', $message['action']));
-
-                return;
-        }
-        $action->handle($this->_target, $this->_logger);
-    }
-
-    /**
-     * Process incoming event.
-     *
-     * @param array $message
-     */
-    protected function _processEvent(
-        array $message)
-    {
-        $this->_logger->info(sprintf('Received event "%s"', $message['event']));
-        switch ($message['event']) {
-            case Event::PATCH:
-                /** @var Event\Patch $event */
-                $event = new Event\Patch($message);
-                break;
-            default:
-                $this->_logger->warning(sprintf('Event "%s" is ignored (unknown type)', $message['event']));
-
-                return;
-        }
-        $event->handle($this->_target, $this->_logger);
-    }
-
-    /**
-     * Process single incoming message.
-     *
-     * @param array $message
-     */
-    protected function _processSingleMessage(
-        array $message)
-    {
-        if (isset($message['event'])) {
-            $this->_processEvent($message);
-        } elseif (isset($message['action'])) {
-            $this->_processAction($message);
-        } else {
-            $this->_logger->warning('Invalid message (both event and action are missing)');
-        }
-    }
-
-    /**
-     * Process incoming message.
-     *
-     * @param string $message
-     */
-    protected function _processMessage(
-        $message)
-    {
-        $this->_logger->info(sprintf('Received message %s', $message));
-        // TODO: Rewrite this in a nicer way? Such as checking for keys on the
-        // decoded array to determine if key [0] exists (hence a multi-message)?
-        $isMultiMessages = is_string($message) && $message !== '' && $message[0] === '[';
-        $message = HttpClient::api_body_decode($message);
-        if (!$isMultiMessages) {
-            $this->_processSingleMessage($message);
-        } else {
-            foreach ($message as $singleMessage) {
-                $this->_processSingleMessage($singleMessage);
-            }
-        }
-    }
-
-    /**
-     * Load experiments.
-     *
-     * @param array $experiments
+     * @param ExperimentsInterface $experiments
      */
     protected function _loadExperiments(
-        array $experiments)
+        ExperimentsInterface $experiments)
     {
+        $this->_experiments = $experiments;
+
         // Direct features.
-        $directFeatures = isset($experiments['ig_android_realtime_iris'])
-            ? $experiments['ig_android_realtime_iris'] : [];
-        $this->_irisEnabled = $this->_isFeatureEnabled($directFeatures, 'is_direct_over_iris_enabled');
-        if (isset($directFeatures['pubsub_msg_type_blacklist'])) {
-            $this->_msgTypeBlacklist = $directFeatures['pubsub_msg_type_blacklist'];
-        }
+        $this->_irisEnabled = $experiments->isExperimentEnabled(
+            'ig_android_realtime_iris',
+            'is_direct_over_iris_enabled'
+        );
+        $this->_msgTypeBlacklist = $experiments->getExperimentParam(
+            'ig_android_realtime_iris',
+            'pubsub_msg_type_blacklist',
+            ''
+        );
 
         // Live features.
-        $liveFeatures = isset($experiments['ig_android_skywalker_live_event_start_end'])
-            ? $experiments['ig_android_skywalker_live_event_start_end'] : [];
-        $this->_mqttLiveEnabled = $this->_isFeatureEnabled($liveFeatures, 'is_enabled');
+        $this->_mqttLiveEnabled = $experiments->isExperimentEnabled(
+            'ig_android_skywalker_live_event_start_end',
+            'is_enabled'
+        );
 
         // GraphQL features.
-        $graphqlFeatures = isset($experiments['ig_android_gqls_typing_indicator'])
-            ? $experiments['ig_android_gqls_typing_indicator'] : [];
-        $this->_graphQlEnabled = $this->_isFeatureEnabled($graphqlFeatures, 'is_enabled');
+        $this->_graphQlTypingEnabled = $experiments->isExperimentEnabled(
+            'ig_android_gqls_typing_indicator',
+            'is_enabled'
+        );
 
-        // Set up PubSub topics.
-        $this->_pubsubTopics = [];
-        if ($this->_mqttLiveEnabled) {
-            $this->_pubsubTopics[] = sprintf(self::LIVE_TOPIC_TEMPLATE, $this->_auth->getUserId());
-        }
-        $this->_pubsubTopics[] = sprintf(self::DIRECT_TOPIC_TEMPLATE, $this->_auth->getUserId());
+        // Presence features.
+        $this->_inboxPresenceEnabled = $experiments->isExperimentEnabled(
+            'ig_android_direct_inbox_presence',
+            'is_enabled'
+        );
+        $this->_threadPresenceEnabled = $experiments->isExperimentEnabled(
+            'ig_android_direct_thread_presence',
+            'is_enabled'
+        );
 
-        // Set up GraphQL topics.
-        $this->_graphqlTopics = [];
-        if ($this->_graphQlEnabled) {
-            $this->_graphqlTopics[] = sprintf(self::TYPING_TOPIC_TEMPLATE, $this->_auth->getUserId());
-        }
+        // Various features.
+        $this->_regionHintEnabled = $experiments->isExperimentEnabled(
+            'ig_android_mqtt_region_hint_universe',
+            'is_enabled'
+        );
     }
 
-    /**
-     * Return MQTT client capabilities.
-     *
-     * @return int
-     */
-    protected function _getCapabilities()
+    protected function _initSubscriptions()
     {
-        if ($this->_capabilities === null) {
-            $this->_capabilities = 0
-                | 1 << self::CP_ACKNOWLEDGED_DELIVERY
-                | 1 << self::CP_PROCESSING_LASTACTIVE_PRESENCEINFO
-                | 1 << self::CP_EXACT_KEEPALIVE
-                | 0 << self::CP_REQUIRES_JSON_UNICODE_ESCAPES
-                | 1 << self::CP_DELTA_SENT_MESSAGE_ENABLED
-                | 1 << self::CP_USE_ENUM_TOPIC
-                | 0 << self::CP_SUPPRESS_GETDIFF_IN_CONNECT
-                | 1 << self::CP_USE_THRIFT_FOR_INBOX
-                | 1 << self::CP_USE_SEND_PINGRESP
-                | 0 << self::CP_REQUIRE_REPLAY_PROTECTION
-                | 0 << self::CP_DATA_SAVING_MODE
-                | 0 << self::CP_TYPING_OFF_WHEN_SENDING_MESSAGE;
+        $subscriptionId = Signatures::generateUUID();
+        // Set up PubSub topics.
+        $liveSubscription = new LiveSubscription($this->_auth->getUserId());
+        if ($this->_mqttLiveEnabled) {
+            $this->_doAddSubscription($liveSubscription, false);
+        } else {
+            $this->_doRemoveSubscription($liveSubscription, false);
         }
+        // Direct subscription is always enabled.
+        $this->_doAddSubscription(new DirectSubscription($this->_auth->getUserId()), false);
 
-        return $this->_capabilities;
+        // Set up GraphQL topics.
+        $graphQlTypingSubscription = new DirectTypingSubscription($this->_auth->getUserId());
+        if ($this->_graphQlTypingEnabled) {
+            $this->_doAddSubscription($graphQlTypingSubscription, false);
+        } else {
+            $this->_doRemoveSubscription($graphQlTypingSubscription, false);
+        }
+        $appPresenceSubscription = new AppPresenceSubscription($subscriptionId);
+        if (($this->_inboxPresenceEnabled || $this->_threadPresenceEnabled) && empty($this->_additionalOptions['disable_presence'])) {
+            $this->_doAddSubscription($appPresenceSubscription, false);
+        } else {
+            $this->_doRemoveSubscription($appPresenceSubscription, false);
+        }
     }
 
     /**
@@ -492,28 +455,62 @@ class Mqtt implements PersistentInterface
             'platform'      => Constants::PLATFORM,
             'app_version'   => Constants::IG_VERSION,
             'capabilities'  => Constants::X_IG_Capabilities,
-            'User-Agent'    => $this->_device->getUserAgent(),
-            'ig_mqtt_route' => 'django',
         ];
+        // Everclear subscriptions.
+        $everclearSubscriptions = [];
+        if ($this->_inboxPresenceEnabled) {
+            $everclearSubscriptions[AppPresenceSubscription::ID] = AppPresenceSubscription::QUERY;
+        }
+        if (count($everclearSubscriptions)) {
+            $result['everclear_subscriptions'] = json_encode($everclearSubscriptions);
+        }
+        // Maintaining the order.
+        $result['User-Agent'] = $this->_device->getUserAgent();
+        $result['ig_mqtt_route'] = 'django';
         // PubSub message type blacklist.
         $msgTypeBlacklist = '';
-        if ($this->_msgTypeBlacklist !== null && strlen($this->_msgTypeBlacklist)) {
+        if ($this->_msgTypeBlacklist !== null && $this->_msgTypeBlacklist !== '') {
             $msgTypeBlacklist = $this->_msgTypeBlacklist;
         }
-        if ($this->_graphQlEnabled) {
-            if (strlen($msgTypeBlacklist)) {
+        if ($this->_graphQlTypingEnabled) {
+            if ($msgTypeBlacklist !== '') {
                 $msgTypeBlacklist .= ', typing_type';
             } else {
                 $msgTypeBlacklist = 'typing_type';
             }
         }
-        if (strlen($msgTypeBlacklist)) {
+        if ($msgTypeBlacklist !== '') {
             $result['pubsub_msg_type_blacklist'] = $msgTypeBlacklist;
         }
-        // Accept-Language should be last one.
+        // Accept-Language must be the last one.
         $result['Accept-Language'] = Constants::ACCEPT_LANGUAGE;
 
         return $result;
+    }
+
+    /**
+     * Get a list of topics to subscribe at connect.
+     *
+     * @return string[]
+     */
+    protected function _getSubscribeTopics()
+    {
+        $topics = [
+            Mqtt\Topics::PUBSUB,
+        ];
+        if ($this->_regionHintEnabled) {
+            $topics[] = Mqtt\Topics::REGION_HINT;
+        }
+        if ($this->_graphQlTypingEnabled) {
+            $topics[] = Mqtt\Topics::REALTIME_SUB;
+        }
+        $topics[] = Mqtt\Topics::SEND_MESSAGE_RESPONSE;
+        if ($this->_irisEnabled) {
+            $topics[] = Mqtt\Topics::IRIS_SUB_RESPONSE;
+            $topics[] = Mqtt\Topics::MESSAGE_SYNC;
+        }
+
+        return $topics;
     }
 
     /**
@@ -527,28 +524,17 @@ class Mqtt implements PersistentInterface
         $sessionId = (microtime(true) - strtotime('Last Monday')) * 1000;
         // Random buster-string to avoid clashing with other data.
         $randNum = mt_rand(1000000, 9999999);
-        $topics = [
-            self::PUBSUB_TOPIC,
-        ];
-        if ($this->_graphQlEnabled) {
-            $topics[] = self::REALTIME_SUB_TOPIC;
-        }
-        $topics[] = self::SEND_MESSAGE_RESPONSE_TOPIC;
-        if ($this->_irisEnabled) {
-            $topics[] = self::IRIS_SUB_RESPONSE_TOPIC;
-            $topics[] = self::MESSAGE_SYNC_TOPIC;
-        }
-        $result = json_encode([
+        $fields = [
             // USER_ID
             'u'                 => '%ACCOUNT_ID_'.$randNum.'%',
             // AGENT
             'a'                 => $this->_device->getFbUserAgent(Constants::INSTAGRAM_APPLICATION_NAME),
             // CAPABILITIES
-            'cp'                => $this->_getCapabilities(),
+            'cp'                => Mqtt\Capabilities::DEFAULT_SET,
             // CLIENT_MQTT_SESSION_ID
             'mqtt_sid'          => '%SESSION_ID_'.$randNum.'%',
             // NETWORK_TYPE
-            'nwt'               => self::NETWORK_TYPE_WIFI,
+            'nwt'               => Mqtt\Config::NETWORK_TYPE_WIFI,
             // NETWORK_SUBTYPE
             'nwst'              => 0,
             // MAKE_USER_AVAILABLE_IN_FOREGROUND
@@ -564,19 +550,24 @@ class Mqtt implements PersistentInterface
             // ENDPOINT_CAPABILITIES
             'ecp'               => 0,
             // PUBLISH_FORMAT
-            'pf'                => self::PUBLISH_FORMAT,
+            'pf'                => Mqtt\Config::PUBLISH_FORMAT,
             // CLIENT_TYPE
-            'ct'                => self::CLIENT_TYPE,
+            'ct'                => Mqtt\Config::CLIENT_TYPE,
             // APP_ID
             'aid'               => Constants::FACEBOOK_ANALYTICS_APPLICATION_ID,
             // SUBSCRIBE_TOPICS
-            'st'                => $topics,
-            // CLIENT_STACK
-            'clientStack'       => 3,
-            // APP_SPECIFIC_INFO
-            'app_specific_info' => $this->_getAppSpecificInfo(),
-        ]);
-        $result = strtr($result, [
+            'st'                => $this->_getSubscribeTopics(),
+        ];
+        // REGION_PREFERENCE
+        if (!empty($this->_additionalOptions['datacenter'])) {
+            $fields['dc'] = $this->_additionalOptions['datacenter'];
+        }
+        // Maintaining the order.
+        $fields['clientStack'] = 3;
+        $fields['app_specific_info'] = $this->_getAppSpecificInfo();
+        // Account and session IDs must be a number, but int size is platform dependent in PHP,
+        // so we are replacing JSON strings with plain strings in JSON encoded data.
+        $result = strtr(json_encode($fields), [
             json_encode('%ACCOUNT_ID_'.$randNum.'%') => $this->_auth->getUserId(),
             json_encode('%SESSION_ID_'.$randNum.'%') => round($sessionId),
         ]);
@@ -612,14 +603,14 @@ class Mqtt implements PersistentInterface
         $client->on('connect', function () {
             $this->_logger->info('Connected to a broker');
             $this->_setKeepaliveTimer();
-            $this->_subscribe();
+            $this->_restoreAllSubscriptions();
         });
         $client->on('ping', function () {
-            $this->_logger->info('Ping flow completed');
+            $this->_logger->debug('Ping flow completed');
             $this->_setKeepaliveTimer();
         });
         $client->on('publish', function () {
-            $this->_logger->info('Publish flow completed');
+            $this->_logger->debug('Publish flow completed');
             $this->_setKeepaliveTimer();
         });
         $client->on('message', function (Message $message) {
@@ -634,98 +625,49 @@ class Mqtt implements PersistentInterface
     }
 
     /**
-     * Subscribe to Iris.
-     */
-    protected function _subscribeToIris()
-    {
-        if (!$this->_irisEnabled || $this->_sequenceId === self::INVALID_SEQUENCE_ID || $this->_sequenceId === null) {
-            return;
-        }
-        $this->_logger->info(sprintf('Subscribing to iris with sequence %d', $this->_sequenceId));
-        $command = [
-            'seq_id' => $this->_sequenceId,
-        ];
-        $this->_publish(self::IRIS_SUB_TOPIC, Realtime::jsonEncode($command), self::ACKNOWLEDGED_DELIVERY);
-    }
-
-    /**
-     * Update Iris sequence ID.
+     * Mass update subscriptions statuses.
      *
-     * @param int $sequenceId
+     * @param string                  $topic
+     * @param SubscriptionInterface[] $subscribe
+     * @param SubscriptionInterface[] $unsubscribe
      */
-    public function updateSequenceId(
-        $sequenceId)
+    protected function _updateSubscriptions(
+        $topic,
+        array $subscribe,
+        array $unsubscribe)
     {
-        if ($sequenceId === null || $sequenceId === self::INVALID_SEQUENCE_ID || $this->_sequenceId == $sequenceId) {
-            return;
+        if (count($subscribe)) {
+            $this->_logger->info(sprintf('Subscribing to %s topics %s', $topic, implode(', ', $subscribe)));
         }
-        $this->_sequenceId = $sequenceId;
-        $this->_logger->info(sprintf('Sequence updated to %d', $this->_sequenceId));
-        if ($this->_isConnected()) {
-            $this->_subscribeToIris();
+        if (count($unsubscribe)) {
+            $this->_logger->info(sprintf('Unsubscribing from %s topics %s', $topic, implode(', ', $subscribe)));
+        }
+
+        try {
+            $this->sendCommand(new UpdateSubscriptions($topic, $subscribe, $unsubscribe));
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage());
         }
     }
 
     /**
      * Subscribe to all topics.
      */
-    protected function _subscribe()
+    protected function _restoreAllSubscriptions()
     {
-        if (count($this->_pubsubTopics)) {
-            $this->_logger->info(sprintf('Subscribing to pubsub topics %s', implode(', ', $this->_pubsubTopics)));
-            $command = [
-                'sub' => $this->_pubsubTopics,
-            ];
-            $this->_publish(self::PUBSUB_TOPIC, Realtime::jsonEncode($command), self::ACKNOWLEDGED_DELIVERY);
-        }
-        $this->_subscribeToIris();
-        if (count($this->_graphqlTopics)) {
-            $this->_logger->info(sprintf('Subscribing to graphql topics %s', implode(', ', $this->_graphqlTopics)));
-            $command = [
-                'sub' => $this->_graphqlTopics,
-            ];
-            $this->_publish(self::REALTIME_SUB_TOPIC, Realtime::jsonEncode($command), self::ACKNOWLEDGED_DELIVERY);
+        foreach ($this->_subscriptions as $topic => $subscriptions) {
+            $this->_updateSubscriptions($topic, $subscriptions, []);
         }
     }
 
     /**
      * Unsubscribe from all topics.
      */
-    protected function _unsubscribe()
+    protected function _removeAllSubscriptions()
     {
-        if (count($this->_pubsubTopics)) {
-            $this->_logger->info(sprintf('Unsubscribing from pubsub topics %s', implode(', ', $this->_pubsubTopics)));
-            $command = [
-                'unsub' => $this->_pubsubTopics,
-            ];
-            $this->_publish(self::PUBSUB_TOPIC, Realtime::jsonEncode($command), self::ACKNOWLEDGED_DELIVERY);
+        foreach ($this->_subscriptions as $topic => $subscriptions) {
+            $this->_updateSubscriptions($topic, [], $subscriptions);
         }
-        if (count($this->_graphqlTopics)) {
-            $this->_logger->info(sprintf('Unsubscribing from graphql topics %s', implode(', ', $this->_graphqlTopics)));
-            $command = [
-                'unsub' => $this->_graphqlTopics,
-            ];
-            $this->_publish(self::REALTIME_SUB_TOPIC, Realtime::jsonEncode($command), self::ACKNOWLEDGED_DELIVERY);
-        }
-    }
-
-    /**
-     * Returns mapping of human readable topics to their identifiers.
-     *
-     * @return array
-     */
-    protected function _getTopicsMapping()
-    {
-        return [
-            self::PUBSUB_TOPIC                => self::PUBSUB_TOPIC_ID,
-            self::SEND_MESSAGE_TOPIC          => self::SEND_MESSAGE_TOPIC_ID,
-            self::SEND_MESSAGE_RESPONSE_TOPIC => self::SEND_MESSAGE_RESPONSE_TOPIC_ID,
-            self::IRIS_SUB_TOPIC              => self::IRIS_SUB_TOPIC_ID,
-            self::IRIS_SUB_RESPONSE_TOPIC     => self::IRIS_SUB_RESPONSE_TOPIC_ID,
-            self::MESSAGE_SYNC_TOPIC          => self::MESSAGE_SYNC_TOPIC_ID,
-            self::REALTIME_SUB_TOPIC          => self::REALTIME_SUB_TOPIC_ID,
-            self::GRAPHQL_TOPIC               => self::GRAPHQL_TOPIC_ID,
-        ];
     }
 
     /**
@@ -738,9 +680,36 @@ class Mqtt implements PersistentInterface
     protected function _mapTopic(
         $topic)
     {
-        $mapping = $this->_getTopicsMapping();
+        if (array_key_exists($topic, Mqtt\Topics::TOPIC_TO_ID_MAP)) {
+            $result = Mqtt\Topics::TOPIC_TO_ID_MAP[$topic];
+            $this->_logger->debug(sprintf('Topic "%s" has been mapped to "%s"', $topic, $result));
+        } else {
+            $result = $topic;
+            $this->_logger->warning(sprintf('Topic "%s" does not exist in the enum', $topic));
+        }
 
-        return isset($mapping[$topic]) ? $mapping[$topic] : $topic;
+        return $result;
+    }
+
+    /**
+     * Maps topic ID to human readable name.
+     *
+     * @param string $topic
+     *
+     * @return string
+     */
+    protected function _unmapTopic(
+        $topic)
+    {
+        if (array_key_exists($topic, Mqtt\Topics::ID_TO_TOPIC_MAP)) {
+            $result = Mqtt\Topics::ID_TO_TOPIC_MAP[$topic];
+            $this->_logger->debug(sprintf('Topic ID "%s" has been unmapped to "%s"', $topic, $result));
+        } else {
+            $result = $topic;
+            $this->_logger->warning(sprintf('Topic ID "%s" does not exist in the enum', $topic));
+        }
+
+        return $result;
     }
 
     /**
@@ -753,7 +722,7 @@ class Mqtt implements PersistentInterface
         $payload,
         $qosLevel)
     {
-        $this->_logger->info(sprintf('Sending message %s to topic %s', $payload, $topic));
+        $this->_logger->info(sprintf('Sending message "%s" to topic "%s"', $payload, $topic));
         $payload = zlib_encode($payload, ZLIB_ENCODING_DEFLATE, 9);
         // We need to map human readable topic name to its ID because of bandwidth saving.
         $topic = $this->_mapTopic($topic);
@@ -768,62 +737,68 @@ class Mqtt implements PersistentInterface
     protected function _onReceive(
         Message $msg)
     {
-        $topic = $msg->getTopic();
         $payload = @zlib_decode($msg->getPayload());
         if ($payload === false) {
-            $this->_logger->warning('Failed to inflate payload');
+            $this->_logger->warning('Failed to inflate the payload');
 
             return;
         }
-        switch ($topic) {
-            case self::PUBSUB_TOPIC:
-            case self::PUBSUB_TOPIC_ID:
-                $skywalker = new Mqtt\Skywalker($payload);
-                if (!in_array($skywalker->getType(), [Mqtt\Skywalker::TYPE_DIRECT, Mqtt\Skywalker::TYPE_LIVE])) {
-                    $this->_logger->warning(sprintf('Received Skywalker message with unsupported type %d', $skywalker->getType()));
+        $this->_handleMessage($this->_unmapTopic($msg->getTopic()), $payload);
+    }
 
-                    return;
-                }
-                $payload = $skywalker->getPayload();
-                break;
-            case self::GRAPHQL_TOPIC:
-            case self::GRAPHQL_TOPIC_ID:
-            case self::REALTIME_SUB_TOPIC:
-            case self::REALTIME_SUB_TOPIC_ID:
-                $graphQl = new Mqtt\GraphQl($payload);
-                if (!in_array($graphQl->getTopic(), [Mqtt\GraphQl::TOPIC_DIRECT])) {
-                    $this->_logger->warning(sprintf('Received GraphQL message with unsupported topic %s', $graphQl->getTopic()));
+    /**
+     * @param string $topic
+     * @param string $payload
+     */
+    protected function _handleMessage(
+        $topic,
+        $payload)
+    {
+        $this->_logger->debug(
+            sprintf('Received a message from topic "%s"', $topic),
+            [base64_encode($payload)]
+        );
+        if (!isset($this->_parsers[$topic])) {
+            $this->_logger->warning(
+                sprintf('No parser for topic "%s" found, skipping the message(s)', $topic),
+                [base64_encode($payload)]
+            );
 
-                    return;
-                }
-                $payload = $graphQl->getPayload();
-                break;
-            case self::IRIS_SUB_RESPONSE_TOPIC:
-            case self::IRIS_SUB_RESPONSE_TOPIC_ID:
-                $json = HttpClient::api_body_decode($payload);
-                if (!is_array($json)) {
-                    $this->_logger->warning(sprintf('Failed to decode Iris JSON: %s', json_last_error_msg()));
-
-                    return;
-                }
-                /** @var Mqtt\Iris $iris */
-                $iris = new Mqtt\Iris($json);
-                if (!$iris->isSucceeded()) {
-                    $this->_logger->warning(sprintf('Failed to subscribe to Iris (%d): %s', $iris->getErrorType(), $iris->getErrorMessage()));
-                }
-
-                return;
-            case self::SEND_MESSAGE_RESPONSE_TOPIC:
-            case self::SEND_MESSAGE_RESPONSE_TOPIC_ID:
-            case self::MESSAGE_SYNC_TOPIC:
-            case self::MESSAGE_SYNC_TOPIC_ID:
-                break;
-            default:
-                $this->_logger->warning(sprintf('Received message from unsupported topic "%s"', $topic));
-
-                return;
+            return;
         }
-        $this->_processMessage($payload);
+
+        try {
+            $messages = $this->_parsers[$topic]->parseMessage($topic, $payload);
+        } catch (\Exception $e) {
+            $this->_logger->warning($e->getMessage(), [$topic, base64_encode($payload)]);
+
+            return;
+        }
+
+        foreach ($messages as $message) {
+            $module = $message->getModule();
+            if (!isset($this->_handlers[$module])) {
+                $this->_logger->warning(
+                    sprintf('No handler for module "%s" found, skipping the message', $module),
+                    [$message->getData()]
+                );
+
+                continue;
+            }
+
+            $this->_logger->info(
+                sprintf('Processing a message for module "%s"', $module),
+                [$message->getData()]
+            );
+
+            try {
+                $this->_handlers[$module]->handleMessage($message);
+            } catch (Handler\HandlerException $e) {
+                $this->_logger->warning($e->getMessage(), [$message->getData()]);
+            } catch (\Exception $e) {
+                $this->_target->emit('warning', [$e]);
+            }
+        }
     }
 
     /** {@inheritdoc} */

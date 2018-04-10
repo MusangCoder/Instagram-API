@@ -3,7 +3,7 @@
 namespace InstagramAPI;
 
 /**
- * Instagram's Private API v3.
+ * Instagram's Private API v4.
  *
  * TERMS OF USE:
  * - This code is in no way affiliated with, authorized, maintained, sponsored
@@ -17,7 +17,7 @@ namespace InstagramAPI;
  * @author mgp25: Founder, Reversing, Project Leader (https://github.com/mgp25)
  * @author SteveJobzniak (https://github.com/SteveJobzniak)
  */
-class Instagram
+class Instagram implements ExperimentsInterface
 {
     /**
      * Experiments refresh interval in sec.
@@ -153,13 +153,6 @@ class Instagram
     public $isMaybeLoggedIn = false;
 
     /**
-     * Rank token.
-     *
-     * @var string
-     */
-    public $rank_token;
-
-    /**
      * Raw API communication/networking class.
      *
      * @var Client
@@ -204,6 +197,8 @@ class Instagram
     public $discover;
     /** @var Request\Hashtag Collection of Hashtag related functions. */
     public $hashtag;
+    /** @var Request\Highlight Collection of Highlight related functions. */
+    public $highlight;
     /** @var Request\Internal Collection of Internal (non-public) functions. */
     public $internal;
     /** @var Request\Live Collection of Live related functions. */
@@ -288,6 +283,7 @@ class Instagram
         $this->direct = new Request\Direct($this);
         $this->discover = new Request\Discover($this);
         $this->hashtag = new Request\Hashtag($this);
+        $this->highlight = new Request\Highlight($this);
         $this->internal = new Request\Internal($this);
         $this->live = new Request\Live($this);
         $this->location = new Request\Location($this);
@@ -529,29 +525,46 @@ class Instagram
      * regular `login()` function. If you successfully answer their challenge,
      * you will be logged in after this function call.
      *
-     * @param string $verificationCode    Verification code you have received
-     *                                    via SMS.
+     * @param string $username            Your Instagram username.
+     * @param string $password            Your Instagram password.
      * @param string $twoFactorIdentifier Two factor identifier, obtained in
      *                                    login() response. Format: `123456`.
+     * @param string $verificationCode    Verification code you have received
+     *                                    via SMS.
      * @param int    $appRefreshInterval  See `login()` for description of this
      *                                    parameter.
      *
+     * @throws \InvalidArgumentException
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\LoginResponse
      */
     public function finishTwoFactorLogin(
-        $verificationCode,
+        $username,
+        $password,
         $twoFactorIdentifier,
+        $verificationCode,
         $appRefreshInterval = 1800)
     {
-        if (empty($this->username) || empty($this->password)) {
-            throw new \InstagramAPI\Exception\LoginRequiredException(
-                'You must provide a username and password to login() before attempting to finish the two-factor login process.'
-            );
+        if (empty($username) || empty($password)) {
+            throw new \InvalidArgumentException('You must provide a username and password to finishTwoFactorLogin().');
+        }
+        if (empty($verificationCode) || empty($twoFactorIdentifier)) {
+            throw new \InvalidArgumentException('You must provide a verification code and two-factor identifier to finishTwoFactorLogin().');
         }
 
-        $verificationCode = trim(str_replace(' ', '', $verificationCode));
+        // Switch the currently active user/pass if the details are different.
+        // NOTE: The username and password AREN'T actually necessary for THIS
+        // endpoint, but this extra step helps people who statelessly embed the
+        // library directly into a webpage, so they can `finishTwoFactorLogin()`
+        // on their second page load without having to begin any new `login()`
+        // call (since they did that in their previous webpage's library calls).
+        if ($this->username !== $username || $this->password !== $password) {
+            $this->_setUser($username, $password);
+        }
+
+        // Remove all whitespace from the verification code.
+        $verificationCode = preg_replace('/\s+/', '', $verificationCode);
 
         $response = $this->request('accounts/two_factor_login/')
             ->setNeedsAuth(false)
@@ -618,7 +631,7 @@ class Instagram
             || empty($this->settings->get('uuid')) // one of the critically...
             || empty($this->settings->get('phone_id')) // ...important device...
             || empty($this->settings->get('device_id'))) { // ...parameters.
-            // Erase all previously stored device-specific settings.
+            // Erase all previously stored device-specific settings and cookies.
             $this->settings->eraseDeviceSettings();
 
             // Save the chosen device string to settings.
@@ -663,11 +676,9 @@ class Instagram
         if (!$resetCookieJar && $this->settings->isMaybeLoggedIn()) {
             $this->isMaybeLoggedIn = true;
             $this->account_id = $this->settings->get('account_id');
-            $this->rank_token = $this->account_id.'_'.$this->uuid;
         } else {
             $this->isMaybeLoggedIn = false;
             $this->account_id = null;
-            $this->rank_token = null;
         }
 
         // Configures Client for current user AND updates isMaybeLoggedIn state
@@ -698,7 +709,6 @@ class Instagram
         $this->isMaybeLoggedIn = true;
         $this->account_id = $response->getLoggedInUser()->getPk();
         $this->settings->set('account_id', $this->account_id);
-        $this->rank_token = $this->account_id.'_'.$this->uuid;
         $this->settings->set('last_login', time());
     }
 
@@ -711,9 +721,11 @@ class Instagram
     {
         // Calling this non-token API will put a csrftoken in our cookie
         // jar. We must do this before any functions that require a token.
-        $this->internal->syncDeviceFeatures(true);
         $this->internal->readMsisdnHeader();
+        $this->internal->syncDeviceFeatures(true);
+        $this->internal->getZeroRatingTokenResult();
         $this->internal->logAttribution();
+        $this->account->setContactPointPrefill('prefill');
     }
 
     /**
@@ -811,30 +823,31 @@ class Instagram
         // You have been warned.
         if ($justLoggedIn) {
             // Perform the "user has just done a full login" API flow.
-            $this->people->getAutoCompleteUserList();
+            $this->internal->getZeroRatingTokenResult();
+            $this->people->getBootstrapUsers();
             $this->story->getReelsTrayFeed();
-            $this->timeline->getTimelineFeed();
-            $this->direct->getRecentRecipients();
+            $this->timeline->getTimelineFeed(null, ['recovered_from_crash' => true]);
             $this->internal->syncUserFeatures();
             $this->_registerPushChannels();
             $this->direct->getRankedRecipients('reshare', true);
             $this->direct->getRankedRecipients('raven', true);
             $this->direct->getInbox();
-            $this->direct->getVisualInbox();
-            // bootstrap users
             $this->internal->getProfileNotice();
             //$this->internal->getMegaphoneLog();
             $this->people->getRecentActivityInbox();
             $this->internal->getQPFetch();
             $this->media->getBlockedMedia();
             $this->discover->getExploreFeed(null, true);
-            //$this->internal->getFacebookOTA();
+            $this->internal->getFacebookOTA();
         } else {
+            $lastLoginTime = $this->settings->get('last_login');
+            $isSessionExpired = $lastLoginTime === null || (time() - $lastLoginTime) > $appRefreshInterval;
+
             // Act like a real logged in app client refreshing its news timeline.
             // This also lets us detect if we're still logged in with a valid session.
             try {
                 $this->timeline->getTimelineFeed(null, [
-                    'is_pull_to_refresh' => mt_rand(1, 3) < 3,
+                    'is_pull_to_refresh' => $isSessionExpired ? null : mt_rand(1, 3) < 3,
                 ]);
             } catch (\InstagramAPI\Exception\LoginRequiredException $e) {
                 // If our session cookies are expired, we were now told to login,
@@ -844,8 +857,7 @@ class Instagram
 
             // Perform the "user has returned to their already-logged in app,
             // so refresh all feeds to check for news" API flow.
-            $lastLoginTime = $this->settings->get('last_login');
-            if ($lastLoginTime === null || (time() - $lastLoginTime) > $appRefreshInterval) {
+            if ($isSessionExpired) {
                 $this->settings->set('last_login', time());
 
                 // Generate and save a new application session ID.
@@ -853,12 +865,11 @@ class Instagram
                 $this->settings->set('session_id', $this->session_id);
 
                 // Do the rest of the "user is re-opening the app" API flow...
-                $this->people->getAutoCompleteUserList();
+                $this->people->getBootstrapUsers();
                 $this->story->getReelsTrayFeed();
                 $this->direct->getRankedRecipients('reshare', true);
                 $this->direct->getRankedRecipients('raven', true);
                 $this->_registerPushChannels();
-                $this->direct->getRecentRecipients();
                 //$this->internal->getMegaphoneLog();
                 $this->direct->getInbox();
                 $this->people->getRecentActivityInbox();
@@ -928,6 +939,25 @@ class Instagram
     {
         return isset($this->experiments[$experiment][$param])
             && in_array($this->experiments[$experiment][$param], ['enabled', 'true', '1']);
+    }
+
+    /**
+     * Get a parameter value for the given experiment.
+     *
+     * @param string $experiment
+     * @param string $param
+     * @param mixed  $default
+     *
+     * @return mixed
+     */
+    public function getExperimentParam(
+        $experiment,
+        $param,
+        $default = null)
+    {
+        return isset($this->experiments[$experiment][$param])
+            ? $this->experiments[$experiment][$param]
+            : $default;
     }
 
     /**

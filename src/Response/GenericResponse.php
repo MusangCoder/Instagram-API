@@ -22,6 +22,6 @@ use InstagramAPI\Response;
  */
 class GenericResponse extends Response
 {
-    const JSON_PROPERTY_MAP = [
-    ];
+    // WARNING: Don't add any values here. Create new responses.
+    const JSON_PROPERTY_MAP = [];
 }

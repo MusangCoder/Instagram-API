@@ -2,8 +2,10 @@
 
 namespace InstagramAPI\Request;
 
-use InstagramAPI\Constants;
+use InstagramAPI\Exception\RequestHeadersTooLargeException;
+use InstagramAPI\Exception\ThrottledException;
 use InstagramAPI\Response;
+use InstagramAPI\Utils;
 
 /**
  * Functions related to finding, exploring and managing relations with people.
@@ -11,35 +13,67 @@ use InstagramAPI\Response;
 class People extends RequestCollection
 {
     /**
-     * Get details about a specific user via their username.
-     *
-     * @param string $username Username as string (NOT as a numerical ID).
-     *
-     * @throws \InstagramAPI\Exception\InstagramException
-     *
-     * @return \InstagramAPI\Response\UserInfoResponse
-     */
-    public function getInfoByName(
-        $username)
-    {
-        return $this->ig->request("users/{$username}/usernameinfo/")->getResponse(new Response\UserInfoResponse());
-    }
-
-    /**
      * Get details about a specific user via their numerical UserPK ID.
      *
-     * @param string $userId Numerical UserPK ID.
+     * NOTE: The real app uses this particular endpoint for _all_ user lookups
+     * except "@mentions" (where it uses `getInfoByName()` instead).
+     *
+     * @param string      $userId Numerical UserPK ID.
+     * @param string|null $module From which app module (page) you have opened the profile. One of (incomplete):
+     *                            "comment_likers",
+     *                            "comment_owner",
+     *                            "followers",
+     *                            "following",
+     *                            "likers_likers_media_view_profile",
+     *                            "likers_likers_photo_view_profile",
+     *                            "likers_likers_video_view_profile",
+     *                            "newsfeed",
+     *                            "self_followers",
+     *                            "self_following",
+     *                            "self_likers_self_likers_media_view_profile",
+     *                            "self_likers_self_likers_photo_view_profile",
+     *                            "self_likers_self_likers_video_view_profile".
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\UserInfoResponse
      */
     public function getInfoById(
-        $userId)
+        $userId,
+        $module = null)
     {
-        return $this->ig->request("users/{$userId}/info/")
-            ->addParam('device_id', $this->ig->device_id)
-            ->getResponse(new Response\UserInfoResponse());
+        $request = $this->ig->request("users/{$userId}/info/");
+        if ($module !== null) {
+            $request->addParam('from_module', $module);
+        }
+
+        return $request->getResponse(new Response\UserInfoResponse());
+    }
+
+    /**
+     * Get details about a specific user via their username.
+     *
+     * NOTE: The real app only uses this endpoint for profiles opened via "@mentions".
+     *
+     * @param string      $username Username as string (NOT as a numerical ID).
+     * @param string|null $module   From which app module (page) you have opened the profile.
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\UserInfoResponse
+     *
+     * @see People::getInfoById() For the list of supported modules.
+     */
+    public function getInfoByName(
+        $username,
+        $module = null)
+    {
+        $request = $this->ig->request("users/{$username}/usernameinfo/");
+        if ($module !== null) {
+            $request->addParam('from_module', $module);
+        }
+
+        return $request->getResponse(new Response\UserInfoResponse());
     }
 
     /**
@@ -92,8 +126,6 @@ class People extends RequestCollection
     public function getRecentActivityInbox()
     {
         return $this->ig->request('news/inbox/')
-            ->addParam('activity_module', 'all')
-            ->addParam('show_su', 'true')
             ->getResponse(new Response\ActivityNewsResponse());
     }
 
@@ -121,25 +153,32 @@ class People extends RequestCollection
     }
 
     /**
-     * Retrieve list of all friends.
+     * Retrieve bootstrap user data (autocompletion user list).
      *
      * WARNING: This is a special, very heavily throttled API endpoint.
      * Instagram REQUIRES that you wait several minutes between calls to it.
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
-     * @return \InstagramAPI\Response\AutoCompleteUserListResponse|null Will be NULL if throttled by Instagram.
+     * @return \InstagramAPI\Response\BootstrapUsersResponse|null Will be NULL if throttled by Instagram.
      */
-    public function getAutoCompleteUserList()
+    public function getBootstrapUsers()
     {
-        try {
-            $request = $this->ig->request('friendships/autocomplete_user_list/')
-                ->addParam('version', '2');
+        $surfaces = [
+            'coefficient_direct_recipients_ranking_variant_2',
+            'coefficient_direct_recipients_ranking',
+            'coefficient_ios_section_test_bootstrap_ranking',
+            'autocomplete_user_list',
+        ];
 
-            return $request->getResponse(new Response\AutoCompleteUserListResponse());
-        } catch (\InstagramAPI\Exception\ThrottledException $e) {
+        try {
+            $request = $this->ig->request('scores/bootstrap/users/')
+                ->addParam('surfaces', json_encode($surfaces));
+
+            return $request->getResponse(new Response\BootstrapUsersResponse());
+        } catch (ThrottledException $e) {
             // Throttling is so common that we'll simply return NULL in that case.
-            return;
+            return null;
         }
     }
 
@@ -266,20 +305,27 @@ class People extends RequestCollection
      * Get list of who a user is following.
      *
      * @param string      $userId      Numerical UserPK ID.
+     * @param string      $rankToken   The list UUID. You must use the same value for all pages of the list.
      * @param null|string $searchQuery Limit the userlist to ones matching the query.
      * @param null|string $maxId       Next "maximum ID", used for pagination.
      *
+     * @throws \InvalidArgumentException
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\FollowerAndFollowingResponse
+     *
+     * @see Signatures::generateUUID() To create a UUID.
+     * @see examples/rankTokenUsage.php For an example.
      */
     public function getFollowing(
         $userId,
+        $rankToken,
         $searchQuery = null,
         $maxId = null)
     {
+        Utils::throwIfInvalidRankToken($rankToken);
         $request = $this->ig->request("friendships/{$userId}/following/")
-            ->addParam('rank_token', $this->ig->rank_token);
+            ->addParam('rank_token', $rankToken);
         if ($searchQuery !== null) {
             $request->addParam('query', $searchQuery);
         }
@@ -294,20 +340,27 @@ class People extends RequestCollection
      * Get list of who a user is followed by.
      *
      * @param string      $userId      Numerical UserPK ID.
+     * @param string      $rankToken   The list UUID. You must use the same value for all pages of the list.
      * @param null|string $searchQuery Limit the userlist to ones matching the query.
      * @param null|string $maxId       Next "maximum ID", used for pagination.
      *
+     * @throws \InvalidArgumentException
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\FollowerAndFollowingResponse
+     *
+     * @see Signatures::generateUUID() To create a UUID.
+     * @see examples/rankTokenUsage.php For an example.
      */
     public function getFollowers(
         $userId,
+        $rankToken,
         $searchQuery = null,
         $maxId = null)
     {
+        Utils::throwIfInvalidRankToken($rankToken);
         $request = $this->ig->request("friendships/{$userId}/followers/")
-            ->addParam('rank_token', $this->ig->rank_token);
+            ->addParam('rank_token', $rankToken);
         if ($searchQuery !== null) {
             $request->addParam('query', $searchQuery);
         }
@@ -321,106 +374,97 @@ class People extends RequestCollection
     /**
      * Get list of who you are following.
      *
+     * @param string      $rankToken   The list UUID. You must use the same value for all pages of the list.
      * @param null|string $searchQuery Limit the userlist to ones matching the query.
      * @param null|string $maxId       Next "maximum ID", used for pagination.
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\FollowerAndFollowingResponse
+     *
+     * @see Signatures::generateUUID() To create a UUID.
+     * @see examples/rankTokenUsage.php For an example.
      */
     public function getSelfFollowing(
+        $rankToken,
         $searchQuery = null,
         $maxId = null)
     {
-        return $this->getFollowing($this->ig->account_id, $searchQuery, $maxId);
+        return $this->getFollowing($this->ig->account_id, $rankToken, $searchQuery, $maxId);
     }
 
     /**
      * Get list of your own followers.
      *
+     * @param string      $rankToken   The list UUID. You must use the same value for all pages of the list.
      * @param null|string $searchQuery Limit the userlist to ones matching the query.
      * @param null|string $maxId       Next "maximum ID", used for pagination.
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\FollowerAndFollowingResponse
+     *
+     * @see Signatures::generateUUID() To create a UUID.
+     * @see examples/rankTokenUsage.php For an example.
      */
     public function getSelfFollowers(
+        $rankToken,
         $searchQuery = null,
         $maxId = null)
     {
-        return $this->getFollowers($this->ig->account_id, $searchQuery, $maxId);
+        return $this->getFollowers($this->ig->account_id, $rankToken, $searchQuery, $maxId);
     }
 
     /**
      * Search for Instagram users.
      *
-     * @param string $query The username or full name to search for.
+     * @param string         $query       The username or full name to search for.
+     * @param string[]|int[] $excludeList Array of numerical user IDs (ie "4021088339")
+     *                                    to exclude from the response, allowing you to skip users
+     *                                    from a previous call to get more results.
+     * @param string|null    $rankToken   A rank token from a first call response.
      *
+     * @throws \InvalidArgumentException                  If invalid query or
+     *                                                    trying to exclude too
+     *                                                    many user IDs.
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\SearchUserResponse
+     *
+     * @see SearchUserResponse::getRankToken() To get a rank token from the response.
+     * @see examples/paginateWithExclusion.php For an example.
      */
     public function search(
-        $query)
-    {
-        return $this->ig->request('users/search/')
-            ->addParam('ig_sig_key_version', Constants::SIG_KEY_VERSION)
-            ->addParam('is_typeahead', true)
-            ->addParam('query', $query)
-            ->addParam('rank_token', $this->ig->rank_token)
-            ->getResponse(new Response\SearchUserResponse());
-    }
-
-    /**
-     * Search for Instagram users, hashtags and places via Facebook's algorithm.
-     *
-     * This performs a combined search for "top results" in all 3 areas at once.
-     *
-     * @param string $query     The username/full name, hashtag or location to search for.
-     * @param string $latitude  (optional) Latitude.
-     * @param string $longitude (optional) Longitude.
-     *
-     * @throws \InstagramAPI\Exception\InstagramException
-     *
-     * @return \InstagramAPI\Response\FBSearchResponse
-     */
-    public function searchFacebook(
         $query,
-        $latitude = null,
-        $longitude = null)
+        array $excludeList = [],
+        $rankToken = null)
     {
-        $request = $this->ig->request('fbsearch/topsearch_flat/')
-            ->addParam('context', 'blended')
-            ->addParam('query', $query)
-            ->addParam('count', 30)
-            ->addParam('timezone_offset', date('Z'));
-
-        if ($latitude !== null && $longitude !== null) {
-            $request
-                ->addParam('lat', $latitude)
-                ->addParam('lng', $longitude);
+        // Do basic query validation.
+        if (!is_string($query) || $query === '') {
+            throw new \InvalidArgumentException('Query must be a non-empty string.');
         }
 
-        return $request->getResponse(new Response\FBSearchResponse());
-    }
+        $request = $this->_paginateWithExclusion(
+            $this->ig->request('users/search/')
+                ->addParam('q', $query)
+                ->addParam('timezone_offset', date('Z')),
+            $excludeList,
+            $rankToken
+        );
 
-    /**
-     * Get recent searches via Facebook's algorithm.
-     *
-     * NOTE: Despite its name, it doesn't simply return "recent searches".
-     * It seems to list profiles that you've found via the searching/discovery
-     * mechanisms AND then visited. In the app, they're listed as the "Recent"
-     * users in the user-search window.
-     *
-     * @throws \InstagramAPI\Exception\InstagramException
-     *
-     * @return \InstagramAPI\Response\RecentFacebookSearchesResponse
-     */
-    public function getRecentFacebookSearches()
-    {
-        return $this->ig->request('fbsearch/recent_searches/')
-            ->getResponse(new Response\RecentFacebookSearchesResponse());
+        try {
+            /** @var Response\SearchUserResponse $result */
+            $result = $request->getResponse(new Response\SearchUserResponse());
+        } catch (RequestHeadersTooLargeException $e) {
+            $result = new Response\SearchUserResponse([
+                'has_more'    => false,
+                'num_results' => 0,
+                'users'       => [],
+                'rank_token'  => $rankToken,
+            ]);
+        }
+
+        return $result;
     }
 
     /**
@@ -441,9 +485,11 @@ class People extends RequestCollection
     public function linkAddressBook(
         array $contacts)
     {
-        return $this->ig->request('address_book/link/?include=extra_display_name,thumbnails')
+        return $this->ig->request('address_book/link/')
             ->setSignedPost(false)
             ->addPost('contacts', json_encode($contacts))
+            ->addPost('_uuid', $this->ig->uuid)
+            ->addPost('_csrftoken', $this->ig->client->getToken())
             ->getResponse(new Response\LinkAddressBookResponse());
     }
 
@@ -476,11 +522,12 @@ class People extends RequestCollection
     public function discoverPeople()
     {
         return $this->ig->request('discover/ayml/')
+            ->setSignedPost(false)
+            ->addPost('phone_id', $this->ig->phone_id)
+            ->addPost('module', 'discover_people')
             ->addPost('_uuid', $this->ig->uuid)
-            ->addPost('_uid', $this->ig->account_id)
             ->addPost('_csrftoken', $this->ig->client->getToken())
             ->addPost('paginate', true)
-            ->addPost('module', 'discover_people')
             ->getResponse(new Response\DiscoverPeopleResponse());
     }
 
@@ -519,25 +566,6 @@ class People extends RequestCollection
             ->addPost('_csrftoken', $this->ig->client->getToken())
             ->addPost('module', 'discover_people')
             ->getResponse(new Response\SuggestedUsersBadgeResponse());
-    }
-
-    /**
-     * Get suggested users via Facebook's algorithm.
-     *
-     * NOTE: This seems to list profiles that you have manually searched for
-     * and frequently visited. In the app, they're listed as the "Suggested"
-     * top users in the user-search window.
-     *
-     * @throws \InstagramAPI\Exception\InstagramException
-     *
-     * @return \InstagramAPI\Response\SuggestedUsersFacebookResponse
-     */
-    public function getSuggestedUsersFacebook()
-    {
-        return $this->ig->request('fbsearch/suggested_searches/')
-            ->addParam('type', 'blended')
-            ->addParam('rank_token', $this->ig->rank_token)
-            ->getResponse(new Response\SuggestedUsersFacebookResponse());
     }
 
     /**
@@ -645,6 +673,7 @@ class People extends RequestCollection
             ->addPost('_uuid', $this->ig->uuid)
             ->addPost('_uid', $this->ig->account_id)
             ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->addPost('user_id', $userId)
             ->getResponse(new Response\FavoriteResponse());
     }
 
@@ -664,6 +693,7 @@ class People extends RequestCollection
             ->addPost('_uuid', $this->ig->uuid)
             ->addPost('_uid', $this->ig->account_id)
             ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->addPost('user_id', $userId)
             ->getResponse(new Response\FavoriteResponse());
     }
 
@@ -710,13 +740,21 @@ class People extends RequestCollection
     /**
      * Get a list of all blocked users.
      *
+     * @param null|string $maxId Next "maximum ID", used for pagination.
+     *
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\BlockedListResponse
      */
-    public function getBlockedList()
+    public function getBlockedList(
+        $maxId = null)
     {
-        return $this->ig->request('users/blocked_list/')->getResponse(new Response\BlockedListResponse());
+        $request = $this->ig->request('users/blocked_list/');
+        if ($maxId !== null) {
+            $request->addParam('max_id', $maxId);
+        }
+
+        return $request->getResponse(new Response\BlockedListResponse());
     }
 
     /**
@@ -825,27 +863,5 @@ class People extends RequestCollection
             ->addPost('_uid', $this->ig->account_id)
             ->addPost('_csrftoken', $this->ig->client->getToken())
             ->getResponse(new Response\FriendshipResponse());
-    }
-
-    /**
-     * Get the list of user stories you have muted.
-     *
-     * WARNING! DANGEROUS! Although this function exists, it is NOT used by the
-     * official app AT ALL, which means that Instagram can easily detect that
-     * you aren't using the real app. You can possibly get banned by using this
-     * function. If you call this function, you do that AT YOUR OWN RISK and
-     * with full acceptance that you risk losing your Instagram account!
-     *
-     * @throws \InstagramAPI\Exception\InstagramException
-     *
-     * @return \InstagramAPI\Response\MutedReelsResponse
-     */
-    public function getMutedStoryList()
-    {
-        return $this->ig->request('friendships/muted_reels/')
-            ->addPost('_uuid', $this->ig->uuid)
-            ->addPost('_uid', $this->ig->account_id)
-            ->addPost('_csrftoken', $this->ig->client->getToken())
-            ->getResponse(new Response\MutedReelsResponse());
     }
 }

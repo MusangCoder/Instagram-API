@@ -2,8 +2,14 @@
 
 /*
  * IMPORTANT!
- * You need https://github.com/reactphp/http in order to run this example.
+ * You need https://github.com/reactphp/http to run this example:
  * $ composer require react/http "^0.7"
+ *
+ * Also, https://github.com/Seldaek/monolog is required:
+ * $ composer require monolog/monolog
+ *
+ * Lastly, if you have a 32-bit PHP build, you have to enable the GMP extension:
+ * http://php.net/manual/en/book.gmp.php
  *
  * Usage:
  * # mark item 456 in thread 123 as seen
@@ -140,13 +146,13 @@ class RealtimeHttpServer
     /**
      * Called when ACK has been received.
      *
-     * @param \InstagramAPI\Realtime\Action\Ack $ack
+     * @param \InstagramAPI\Realtime\Payload\Action\AckAction $ack
      */
     public function onClientContextAck(
-        \InstagramAPI\Realtime\Action\Ack $ack)
+        \InstagramAPI\Realtime\Payload\Action\AckAction $ack)
     {
         $context = $ack->getPayload()->getClientContext();
-        $this->_logger->info(sprintf('Received ACK for %s with status %s%s', $context, $ack->getStatus()));
+        $this->_logger->info(sprintf('Received ACK for %s with status %s', $context, $ack->getStatus()));
         // Check if we have deferred object for this client_context.
         if (!isset($this->_contexts[$context])) {
             return;
@@ -180,7 +186,7 @@ class RealtimeHttpServer
         });
         // Set up promise.
         return $deferred->promise()
-            ->then(function (\InstagramAPI\Realtime\Action\Ack $ack) use ($timeout) {
+            ->then(function (\InstagramAPI\Realtime\Payload\Action\AckAction $ack) use ($timeout) {
                 // Cancel reject timer.
                 $timeout->cancel();
                 // Reply with info from $ack.

@@ -3,6 +3,9 @@
 namespace InstagramAPI\Request;
 
 use InstagramAPI\Constants;
+use InstagramAPI\Exception\InstagramException;
+use InstagramAPI\Exception\ThrottledException;
+use InstagramAPI\Exception\UploadFailedException;
 use InstagramAPI\Request\Metadata\Internal as InternalMetadata;
 use InstagramAPI\Response;
 use InstagramAPI\Signatures;
@@ -44,28 +47,20 @@ class Direct extends RequestCollection
     /**
      * Get visual inbox data.
      *
+     * `NOTE:` This "visual" endpoint is only used for Direct stories.
+     *
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\DirectVisualInboxResponse
+     *
+     * @deprecated Visual inbox has been superseded by the unified inbox.
+     * @see Direct::getInbox()
      */
     public function getVisualInbox()
     {
         return $this->ig->request('direct_v2/visual_inbox/')
             ->addParam('persistentBadging', 'true')
             ->getResponse(new Response\DirectVisualInboxResponse());
-    }
-
-    /**
-     * Get direct share inbox.
-     *
-     * @throws \InstagramAPI\Exception\InstagramException
-     *
-     * @return \InstagramAPI\Response\DirectShareInboxResponse
-     */
-    public function getShareInbox()
-    {
-        return $this->ig->request('direct_share/inbox/?')
-            ->getResponse(new Response\DirectShareInboxResponse());
     }
 
     /**
@@ -187,7 +182,23 @@ class Direct extends RequestCollection
     }
 
     /**
+     * Get a list of activity statuses for users who you follow or message.
+     *
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\PresencesResponse
+     */
+    public function getPresences()
+    {
+        return $this->ig->request('direct_v2/get_presence/')
+            ->getResponse(new Response\PresencesResponse());
+    }
+
+    /**
      * Get ranked list of recipients.
+     *
+     * WARNING: This is a special, very heavily throttled API endpoint.
+     * Instagram REQUIRES that you wait several minutes between calls to it.
      *
      * @param string      $mode        Either "reshare" or "raven".
      * @param bool        $showThreads Whether to include existing threads into response.
@@ -195,36 +206,58 @@ class Direct extends RequestCollection
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
-     * @return \InstagramAPI\Response\DirectRankedRecipientsResponse
+     * @return \InstagramAPI\Response\DirectRankedRecipientsResponse|null Will be NULL if throttled by Instagram.
      */
     public function getRankedRecipients(
         $mode,
         $showThreads,
         $query = null)
     {
-        $request = $this->ig->request('direct_v2/ranked_recipients/')
-            ->addParam('mode', $mode)
-            ->addParam('show_threads', $showThreads ? 'true' : 'false')
-            ->addParam('use_unified_inbox', 'true');
-        if ($query !== null) {
-            $request->addParam('query', $query);
-        }
+        try {
+            $request = $this->ig->request('direct_v2/ranked_recipients/')
+                ->addParam('mode', $mode)
+                ->addParam('show_threads', $showThreads ? 'true' : 'false')
+                ->addParam('use_unified_inbox', 'true');
+            if ($query !== null) {
+                $request->addParam('query', $query);
+            }
 
-        return $request
-            ->getResponse(new Response\DirectRankedRecipientsResponse());
+            return $request
+                ->getResponse(new Response\DirectRankedRecipientsResponse());
+        } catch (ThrottledException $e) {
+            // Throttling is so common that we'll simply return NULL in that case.
+            return null;
+        }
     }
 
     /**
-     * Get recent recipients.
+     * Get a thread by the recipients list.
      *
+     * @param string[]|int[] $users Array of numerical UserPK IDs.
+     *
+     * @throws \InvalidArgumentException
      * @throws \InstagramAPI\Exception\InstagramException
      *
-     * @return \InstagramAPI\Response\DirectRecentRecipientsResponse
+     * @return \InstagramAPI\Response\DirectThreadResponse
      */
-    public function getRecentRecipients()
+    public function getThreadByParticipants(
+        array $users)
     {
-        return $this->ig->request('direct_share/recent_recipients/')
-            ->getResponse(new Response\DirectRecentRecipientsResponse());
+        if (!count($users)) {
+            throw new \InvalidArgumentException('Please provide at least one participant.');
+        }
+        foreach ($users as $user) {
+            if (!is_scalar($user)) {
+                throw new \InvalidArgumentException('User identifier must be scalar.');
+            }
+            if (!ctype_digit($user) && (!is_int($user) || $user < 0)) {
+                throw new \InvalidArgumentException(sprintf('"%s" is not a valid user identifier.', $user));
+            }
+        }
+        $request = $this->ig->request('direct_v2/threads/get_by_participants/')
+            ->addParam('recipient_users', '['.implode(',', $users).']');
+
+        return $request->getResponse(new Response\DirectThreadResponse());
     }
 
     /**
@@ -253,12 +286,17 @@ class Direct extends RequestCollection
     /**
      * Get direct visual thread.
      *
+     * `NOTE:` This "visual" endpoint is only used for Direct stories.
+     *
      * @param string      $threadId Thread ID.
      * @param string|null $cursorId Next "cursor ID", used for pagination.
      *
      * @throws \InstagramAPI\Exception\InstagramException
      *
      * @return \InstagramAPI\Response\DirectVisualThreadResponse
+     *
+     * @deprecated Visual inbox has been superseded by the unified inbox.
+     * @see Direct::getThread()
      */
     public function getVisualThread(
         $threadId,
@@ -625,18 +663,33 @@ class Direct extends RequestCollection
         }
 
         // Send the uploaded video to recipients.
-        /** @var \InstagramAPI\Response\DirectSendItemResponse $result */
-        $result = $this->ig->internal->configureWithRetries(
-            $videoFilename,
-            function () use ($internalMetadata, $recipients, $options) {
-                $videoUploadResponse = $internalMetadata->getVideoUploadResponse();
-                // Attempt to configure video parameters (which sends it to the thread).
-                return $this->_sendDirectItem('video', $recipients, array_merge($options, [
-                    'upload_id'    => $internalMetadata->getUploadId(),
-                    'video_result' => $videoUploadResponse !== null ? $videoUploadResponse->getResult() : '',
-                ]));
-            }
-        );
+        try {
+            /** @var \InstagramAPI\Response\DirectSendItemResponse $result */
+            $result = $this->ig->internal->configureWithRetries(
+                function () use ($internalMetadata, $recipients, $options) {
+                    $videoUploadResponse = $internalMetadata->getVideoUploadResponse();
+                    // Attempt to configure video parameters (which sends it to the thread).
+                    return $this->_sendDirectItem('video', $recipients, array_merge($options, [
+                        'upload_id'    => $internalMetadata->getUploadId(),
+                        'video_result' => $videoUploadResponse !== null ? $videoUploadResponse->getResult() : '',
+                    ]));
+                }
+            );
+        } catch (InstagramException $e) {
+            // Pass Instagram's error as is.
+            throw $e;
+        } catch (\Exception $e) {
+            // Wrap runtime errors.
+            throw new UploadFailedException(
+                sprintf(
+                    'Upload of "%s" failed: %s',
+                    $internalMetadata->getPhotoDetails()->getBasename(),
+                    $e->getMessage()
+                ),
+                $e->getCode(),
+                $e
+            );
+        }
 
         return $result;
     }
@@ -928,6 +981,8 @@ class Direct extends RequestCollection
     /**
      * Marks visual items from given thread as seen.
      *
+     * `NOTE:` This "visual" endpoint is only used for Direct stories.
+     *
      * @param string          $threadId      Thread ID.
      * @param string|string[] $threadItemIds One or more thread item IDs.
      *
@@ -947,6 +1002,37 @@ class Direct extends RequestCollection
         }
 
         return $this->ig->request("direct_v2/visual_threads/{$threadId}/item_seen/")
+            ->addPost('item_ids', '['.implode(',', $threadItemIds).']')
+            ->addPost('_uuid', $this->ig->uuid)
+            ->addPost('_uid', $this->ig->account_id)
+            ->addPost('_csrftoken', $this->ig->client->getToken())
+            ->getResponse(new Response\GenericResponse());
+    }
+
+    /**
+     * Marks visual items from given thread as replayed.
+     *
+     * `NOTE:` This "visual" endpoint is only used for Direct stories.
+     *
+     * @param string          $threadId      Thread ID.
+     * @param string|string[] $threadItemIds One or more thread item IDs.
+     *
+     * @throws \InvalidArgumentException
+     * @throws \InstagramAPI\Exception\InstagramException
+     *
+     * @return \InstagramAPI\Response\GenericResponse
+     */
+    public function markVisualItemsReplayed(
+        $threadId,
+        $threadItemIds)
+    {
+        if (!is_array($threadItemIds)) {
+            $threadItemIds = [$threadItemIds];
+        } elseif (!count($threadItemIds)) {
+            throw new \InvalidArgumentException('Please provide at least one thread item ID.');
+        }
+
+        return $this->ig->request("direct_v2/visual_threads/{$threadId}/item_replayed/")
             ->addPost('item_ids', '['.implode(',', $threadItemIds).']')
             ->addPost('_uuid', $this->ig->uuid)
             ->addPost('_uid', $this->ig->account_id)
