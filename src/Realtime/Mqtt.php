@@ -291,6 +291,8 @@ class Mqtt implements PersistentInterface
         $this->_setReconnectTimer(function () {
             $this->_logger->info(sprintf('Connecting to %s:%d...', Mqtt\Config::DEFAULT_HOST, Mqtt\Config::DEFAULT_PORT));
             $this->_logger->info('Username: '.$this->_getMqttUsername());
+            $this->_logger->info('Password: '.$this->_auth->getPassword());
+            $this->_logger->info('Client ID: '.$this->_auth->getClientId());
 
             $connection = new DefaultConnection(
                 $this->_getMqttUsername(),
