@@ -6,6 +6,11 @@
             "url": "https://github.com/fagenorn/fbns-react"
         }
     ],
+    "autoload": {
+        "psr-4": {
+            "InstagramAPI\\": "src/"
+        }
+    },
     "require": {
         "php": ">=5.6",
         "lazyjsonmapper/lazyjsonmapper": "^1.6.1",
