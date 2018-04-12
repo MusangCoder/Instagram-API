@@ -29,5 +29,6 @@
         "psr/log": "^1.0",
         "valga/fbns-react": "dev-master",
         "symfony/process": "^3.4|^4.0"
-    }
+    },
+    "minimum-stability": "dev"
 }
