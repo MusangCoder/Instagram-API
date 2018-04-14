@@ -54,7 +54,7 @@ class Connector implements ConnectorInterface
             try {
                 $this->_connectors[$host] = $this->_getSecureConnector(
                     $this->_getSecureContext($this->_instagram->getVerifySSL()),
-                    $this->_getProxyForHost($host, $this->_instagram->getProxy())
+                    $this->_getProxyForHost($host, '')// $this->_instagram->getProxy())
                 );
             } catch (\Exception $e) {
                 return new RejectedPromise($e);
